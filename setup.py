@@ -22,4 +22,9 @@ setup(
     install_requires=[
         'numpy>=1.18.0',
     ],
+    extras_require={
+        'dev': [
+            'pytest>=6.0',  # Add pytest for development testing
+        ]
+    },
 )

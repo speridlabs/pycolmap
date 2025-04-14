@@ -5,7 +5,7 @@ from typing import Dict, Tuple, BinaryIO
 from ..image import Image
 from ..camera import Camera
 from ..point3d import Point3D
-from ..types import CAMERA_MODEL_NAMES, CAMERA_MODEL_IDS
+from ..types import CAMERA_MODEL_NAMES, CAMERA_MODEL_IDS, INVALID_POINT3D_ID
 
 def _read_next_bytes(fid: BinaryIO, num_bytes: int, format_char_sequence: str, endian_character: str = "<") -> tuple:
     """Read and unpack the next bytes from a binary file.
@@ -110,7 +110,7 @@ def read_images_binary(path: str) -> Dict[int, Image]:
                 point3D_id = x_y_id_s[3*i+2]
                 
                 xys.append((x, y))
-                point3D_ids.append(point3D_id)
+                point3D_ids.append(point3D_id if point3D_id != -1 else INVALID_POINT3D_ID)
             
             images[image_id] = Image(
                 id=image_id,
@@ -141,7 +141,9 @@ def read_points3D_binary(path: str) -> Dict[int, Point3D]:
         
         for _ in range(num_points):
             binary_point_line_properties = _read_next_bytes(
-                fid, num_bytes=43, format_char_sequence="QdddBBBd")
+                # TODO: check if this works
+                fid, num_bytes=43, format_char_sequence="qdddBBBd")
+                # fid, num_bytes=43, format_char_sequence="QdddBBBd")
             
             point3D_id = binary_point_line_properties[0]
             xyz = binary_point_line_properties[1:4]

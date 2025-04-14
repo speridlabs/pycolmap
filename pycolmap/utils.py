@@ -15,6 +15,9 @@ def detect_model_format(path: str) -> str:
     Returns:
         File extension ('.bin' or '.txt') if detected, empty string otherwise
     """
+    if not os.path.isdir(path):
+        return "" # Return empty if path is not a directory
+
     if os.path.isfile(os.path.join(path, "cameras.bin")) and \
        os.path.isfile(os.path.join(path, "images.bin")) and \
        os.path.isfile(os.path.join(path, "points3D.bin")):

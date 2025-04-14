@@ -1,7 +1,7 @@
 from enum import Enum
 
 # A special value representing an invalid point3D ID
-INVALID_POINT3D_ID = 2**64 - 1
+INVALID_POINT3D_ID = - 1
 
 class CameraModelType(Enum):
     """Enumeration of camera model types supported by COLMAP."""
