@@ -1,525 +1,537 @@
-import numpy as np
-from typing import Dict, List, Tuple, Optional 
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional, Set
 
 from .image import Image
 from .camera import Camera
 from .point3d import Point3D
-from .types import INVALID_POINT3D_ID, CAMERA_MODEL_NAMES
 
+from .types import INVALID_POINT3D_ID 
 from .io import read_model, write_model
-from .utils import detect_model_format, find_model_path, angle_between_rays
-
+from .utils import find_model_path, angle_between_rays
 
 class ColmapReconstruction:
-    """Main class for handling COLMAP reconstructions."""
-    
-    def __init__(self, path: str):
-        """Initialize a COLMAP reconstruction from a directory.
-        
-        Args:
-            path: Directory containing the COLMAP reconstruction
-        """
-        self.base_path = path
-        self.model_path = self._find_model_path(path)
 
-        if not self.model_path:
-            raise FileNotFoundError(f"Could not find COLMAP reconstruction in {path}")
-        
-        self.model_format = detect_model_format(self.model_path)
-        if not self.model_format:
-            raise ValueError(f"Could not detect model format in {self.model_path}")
-        
-        self.cameras, self.images, self.points3D = read_model(self.model_path, self.model_format)
-        self.name_to_image_id = {image.name: img_id for img_id, image in self.images.items()}
-        self.last_camera_id = max(self.cameras.keys()) if self.cameras else 0
-        self.last_image_id = max(self.images.keys()) if self.images else 0
-    
-    def _find_model_path(self, path: str) -> Optional[str]:
-        """Find the model directory in the given path.
-        
+    """
+    Manages a COLMAP reconstruction, providing an API for accessing,
+    manipulating, and saving camera parameters, image poses, features,
+    and 3D points.
+
+    Attributes:
+        path (str): The path to the directory where the model (cameras, images, points3D) was loaded from or last saved to.
+        cameras (Dict[int, Camera]): Dictionary mapping camera IDs to Camera objects.
+        images (Dict[int, Image]): Dictionary mapping image IDs to Image objects.
+        points3D (Dict[int, Point3D]): Dictionary mapping 3D point IDs to Point3D objects.
+    """
+
+    path: str
+    cameras: Dict[int, Camera]
+    images: Dict[int, Image]
+    points3D: Dict[int, Point3D]
+
+    # Internal lookups and state for efficiency and ID management
+    _image_name_to_id: Dict[str, int]
+    _last_camera_id: int
+    _last_image_id: int
+    _last_point3D_id: int
+
+    def __init__(self, reconstruction_path: str):
+        """
+        Loads a COLMAP reconstruction from a specified path.
+
+        Searches for the model files (cameras, images, points3D) in standard
+        locations ('sparse/0', 'sparse', root) within the `reconstruction_path`.
+        Automatically detects binary or text format.
+
         Args:
-            path: Base directory to search in
-            
-        Returns:
-            Path to the directory containing the model, or None if not found
-        """
-        return find_model_path(path)
-    
-    def save(self, output_path: Optional[str] = None, binary: bool = True) -> None:
-        """Save the current reconstruction.
-        
-        Args:
-            output_path: Directory to save the reconstruction to (defaults to original path)
-            binary: Whether to use binary format (True) or text format (False)
-        """
-        if output_path is None:
-            output_path = self.model_path
-        
-        write_model(self.cameras, self.images, self.points3D, output_path, binary)
-    
-    def get_image_ids(self) -> List[int]:
-        """Get all image IDs in the reconstruction.
-        
-        Returns:
-            List of image IDs
-        """
-        return list(self.images.keys())
-    
-    def get_camera_ids(self) -> List[int]:
-        """Get all camera IDs in the reconstruction.
-        
-        Returns:
-            List of camera IDs
-        """
-        return list(self.cameras.keys())
-    
-    def get_point3D_ids(self) -> List[int]:
-        """Get all 3D point IDs in the reconstruction.
-        
-        Returns:
-            List of 3D point IDs
-        """
-        return list(self.points3D.keys())
-    
-    def get_image_by_name(self, name: str) -> Tuple[int, Image]:
-        """Get an image by its name.
-        
-        Args:
-            name: Image filename
-            
-        Returns:
-            Tuple of (image_id, Image object)
-            
+            reconstruction_path: The path to the COLMAP project directory
+                                 (e.g., '/path/to/project').
+
         Raises:
-            ValueError: If image with the given name is not found
+            FileNotFoundError: If no valid COLMAP model directory can be found
+                             within the specified path.
+            ValueError: If the model format cannot be determined or if there's
+                        an issue during loading.
         """
-        image_id = self.name_to_image_id.get(name)
-        if image_id is None:
-            raise ValueError(f"Image with name {name} not found")
-        return image_id, self.images[image_id]
-    
-    def get_intrinsics(self, camera_id: int) -> np.ndarray:
-        """Get the intrinsic calibration matrix for a camera.
-        
+        model_dir = find_model_path(reconstruction_path)
+
+        if model_dir is None:
+            raise FileNotFoundError(
+                f"Could not find COLMAP model files in standard locations "
+                f"(sparse/0, sparse, or root) within '{reconstruction_path}'"
+            )
+
+        try:
+            values = read_model(model_dir)
+        except (FileNotFoundError, ValueError, EOFError, RuntimeError) as e:
+            raise ValueError(f"Failed to load COLMAP model from '{model_dir}': {e}")
+
+        self.path = model_dir
+        self.cameras, self.images, self.points3D = values
+
+        self._image_name_to_id = {img.name: img_id for img_id, img in self.images.items()}
+        self._last_camera_id = max(self.cameras.keys()) if self.cameras else 0
+        self._last_image_id = max(self.images.keys()) if self.images else 0
+        self._last_point3D_id = max(self.points3D.keys()) if self.points3D else 0
+
+        # Verify consistency between images and points3D (optional but recommended)
+        # TODO: eliminate this
+        self._verify_consistency() # Can be slow for large models
+
+    def save(self, output_path: Optional[str] = None, binary: bool = True) -> None:
+        """
+        Saves the current state of the reconstruction to disk.
+
         Args:
-            camera_id: ID of the camera
-            
-        Returns:
-            3x3 intrinsic matrix
+            output_path: The directory to save the model files (cameras, images,
+                         points3D) into. If None, saves back to the original
+                         load path (`self.path`). The directory will be created
+                         if it doesn't exist. Defaults to None.
+            binary: If True, saves in binary format (.bin). If False, saves in
+                    text format (.txt). Defaults to True.
+
+        Raises:
+            RuntimeError: If saving fails for any reason.
         """
-        if camera_id not in self.cameras:
-            raise ValueError(f"Camera ID {camera_id} not found")
-        
-        return self.cameras[camera_id].get_calibration_matrix()
-    
-    def get_world_to_camera(self, image_id: int) -> np.ndarray:
-        """Get the world-to-camera transformation matrix for an image.
-        
-        Args:
-            image_id: ID of the image
-            
-        Returns:
-            4x4 transformation matrix
+        save_dir = output_path if output_path is not None else self.path
+
+        try:
+            write_model(self.cameras, self.images, self.points3D, save_dir, binary)
+            if output_path is not None: self.path = save_dir
+        except Exception as e:
+            raise RuntimeError(f"Failed to save reconstruction to '{save_dir}': {e}")
+
+    def get_image_by_name(self, name: str) -> Optional[Image]:
         """
-        if image_id not in self.images:
-            raise ValueError(f"Image ID {image_id} not found")
-        
-        return self.images[image_id].get_world_to_camera_matrix()
-    
-    def get_camera_to_world(self, image_id: int) -> np.ndarray:
-        """Get the camera-to-world transformation matrix for an image.
-        
-        Args:
-            image_id: ID of the image
-            
-        Returns:
-            4x4 transformation matrix
+        Retrieves an Image object by its filename.
         """
-        if image_id not in self.images:
-            raise ValueError(f"Image ID {image_id} not found")
-        
-        return self.images[image_id].get_camera_to_world_matrix()
-    
-    def get_camera_center(self, image_id: int) -> Tuple[float, float, float]:
-        """Get the camera center for an image in world coordinates.
-        
-        Args:
-            image_id: ID of the image
-            
-        Returns:
-            Camera center as (x, y, z)
-        """
-        if image_id not in self.images:
-            raise ValueError(f"Image ID {image_id} not found")
-        
-        return self.images[image_id].get_camera_center()
-    
+        image_id = self._image_name_to_id.get(name)
+        return self.images.get(image_id) if image_id is not None else None
+
+
     def add_camera(self, model: str, width: int, height: int, params: List[float]) -> int:
-        """Add a new camera to the reconstruction.
-        
+        """
+        Adds a new camera to the reconstruction.
+        Assigns a new unique camera ID.
+
         Args:
-            model: Camera model name (e.g., 'PINHOLE')
-            width: Image width
-            height: Image height
-            params: Camera parameters
-            
+            model: The COLMAP camera model name (e.g., "PINHOLE").
+            width: Image width in pixels.
+            height: Image height in pixels.
+            params: List of intrinsic parameters matching the model.
+
         Returns:
-            ID of the new camera
+            The newly assigned camera ID.
+
+        Raises:
+            ValueError: If the model name is invalid or parameters are incorrect.
         """
-        # Validate model
-        if model not in CAMERA_MODEL_NAMES:
-            raise ValueError(f"Unknown camera model: {model}")
-        
-        # Validate parameters
-        num_expected_params = CAMERA_MODEL_NAMES[model].num_params
-        if len(params) != num_expected_params:
-            raise ValueError(f"Camera model {model} requires {num_expected_params} parameters, got {len(params)}")
-        
-        # Create new camera
-        self.last_camera_id += 1
-        camera_id = self.last_camera_id
-        
-        # Add camera
-        self.cameras[camera_id] = Camera(
-            id=camera_id,
-            model=model,
-            width=width,
-            height=height,
-            params=params
-        )
-        
-        return camera_id
-    
-    def add_image(self, 
-                 name: str, 
-                 camera_id: int, 
-                 qvec: Tuple[float, float, float, float], 
-                 tvec: Tuple[float, float, float], 
-                 xys: Optional[List[Tuple[float, float]]] = None, 
-                 point3D_ids: Optional[List[int]] = None) -> int:
-        """Add a new image to the reconstruction.
-        
+        self._last_camera_id += 1
+        new_id = self._last_camera_id
+
+        try:
+            new_camera = Camera(id=new_id, model=model, width=width, height=height, params=params)
+            self.cameras[new_id] = new_camera
+            return new_id
+        except ValueError as e:
+            self._last_camera_id -= 1
+            raise e
+
+    def add_image(self, name: str, camera_id: int,
+                  qvec: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+                  tvec: Tuple[float, float, float] = (0.0, 0.0, 0.0)) -> int:
+        """
+        Adds a new, initially featureless, image to the reconstruction.
+
+        Assigns a new unique image ID if `image_id` is not provided. If an ID
+        is provided, it checks for collisions.
+
         Args:
-            name: Image filename
-            camera_id: ID of the camera used
-            qvec: Quaternion for rotation [w, x, y, z]
-            tvec: Translation vector [x, y, z]
-            xys: 2D point coordinates
-            point3D_ids: IDs of corresponding 3D points
-            
+            name: The filename of the image. Must be unique.
+            camera_id: The ID of the camera used for this image. Must exist.
+            qvec: Rotation quaternion (w, x, y, z). Defaults to identity.
+            tvec: Translation vector (x, y, z). Defaults to origin.
+            image_id: Optional specific ID to assign. If None, a new ID is generated.
+
         Returns:
-            ID of the new image
+            The assigned image ID (either provided or newly generated).
+
+        Raises:
+            ValueError: If the name is already used, the camera ID doesn't exist,
+                        or the provided image_id is already taken.
         """
-        # Validate camera
+
+        if name in self._image_name_to_id:
+            raise ValueError(f"Image name '{name}' already exists (ID: {self._image_name_to_id[name]}).")
+
         if camera_id not in self.cameras:
-            raise ValueError(f"Camera ID {camera_id} not found")
-        
-        # Default empty lists
-        xys = xys if xys is not None else []
-        point3D_ids = point3D_ids if point3D_ids is not None else []
-        
-        # Validate lengths
-        if len(xys) != len(point3D_ids):
-            raise ValueError(f"Number of 2D points ({len(xys)}) does not match number of 3D point IDs ({len(point3D_ids)})")
-        
-        # Create new image
-        self.last_image_id += 1
-        image_id = self.last_image_id
-        
-        # Add image
-        self.images[image_id] = Image(
-            id=image_id,
-            name=name,
-            camera_id=camera_id,
-            qvec=qvec,
-            tvec=tvec,
-            xys=xys,
-            point3D_ids=point3D_ids
-        )
-        
-        # Update lookup
-        self.name_to_image_id[name] = image_id
-        
-        return image_id
-    
-    def delete_image(self, image_id: int) -> None:
-        """Delete an image from the reconstruction.
-        
-        Args:
-            image_id: ID of the image to delete
+            raise ValueError(f"Camera with ID {camera_id} does not exist.")
+
+        self._last_image_id += 1
+        new_id = self._last_image_id
+
+        try:
+            new_image = Image(id=new_id, name=name, camera_id=camera_id, qvec=qvec, tvec=tvec)
+            self.images[new_id] = new_image
+            self._image_name_to_id[name] = new_id
+        except ValueError as e:
+            self._last_image_id -= 1
+            raise e
+
+        return new_id
+
+
+    def add_point3D(self, xyz: Tuple[float, float, float],
+                    track: List[Tuple[int, int]], # List of (image_id, point2d_idx)
+                    rgb: Tuple[int, int, int] = (128, 128, 128),
+                    error: float = 0.0) -> int:
         """
-        if image_id not in self.images:
-            raise ValueError(f"Image ID {image_id} not found")
-        
-        # Get image
-        image = self.images[image_id]
-        
-        # Update 3D points
-        for point3D_id in set(image.point3D_ids):
-            if point3D_id == INVALID_POINT3D_ID:
-                continue
-                
-            if point3D_id in self.points3D:
-                point3D = self.points3D[point3D_id]
-                
-                # Find indices of this image in the track
-                indices_to_remove = [i for i, img_id in enumerate(point3D.image_ids) if img_id == image_id]
-                
-                if indices_to_remove:
-                    # Remove this image from the track
-                    new_image_ids = [img_id for i, img_id in enumerate(point3D.image_ids) if i not in indices_to_remove]
-                    new_point2D_idxs = [idx for i, idx in enumerate(point3D.point2D_idxs) if i not in indices_to_remove]
-                    
-                    # If track becomes empty, delete the point
-                    if not new_image_ids:
-                        del self.points3D[point3D_id]
-                    else:
-                        # Update the point
-                        self.points3D[point3D_id] = Point3D(
-                            id=point3D.id,
-                            xyz=point3D.xyz,
-                            rgb=point3D.rgb,
-                            error=point3D.error,
-                            image_ids=new_image_ids,
-                            point2D_idxs=new_point2D_idxs
-                        )
-        
-        # Remove image from name lookup
-        if image.name in self.name_to_image_id:
-            del self.name_to_image_id[image.name]
-        
-        # Delete image
-        del self.images[image_id]
-    
-    def delete_camera(self, camera_id: int, delete_images: bool = False) -> None:
-        """Delete a camera from the reconstruction.
-        
+        Adds a new 3D point to the reconstruction.
+
+        Assigns a new unique point ID if `point3D_id` is not provided. Updates
+        the `point3D_ids` list in the corresponding Image objects based on the track.
+
         Args:
-            camera_id: ID of the camera to delete
-            delete_images: Whether to also delete images using this camera
+            xyz: The 3D coordinates (x, y, z) of the point.
+            track: A list of tuples `(image_id, point2D_idx)` specifying which 2D
+                   features in which images observe this point.
+            rgb: The color (r, g, b). Defaults to gray.
+            error: The reprojection error. Defaults to 0.0.
+
+        Returns:
+            The assigned 3D point ID.
+
+        Raises:
+            ValueError: If validation fails (e.g., provided ID exists, track is invalid,
+                        an image_id in the track doesn't exist, or a point2D_idx is out
+                        of bounds or already assigned to another 3D point).
         """
-        if camera_id not in self.cameras:
-            raise ValueError(f"Camera ID {camera_id} not found")
-        
-        # Check if camera is in use
+        self._last_point3D_id += 1
+        new_id = self._last_point3D_id
+        image_ids = [item[0] for item in track]
+        point2D_idxs = [item[1] for item in track]
+        images_to_update: Dict[int, List[int]] = defaultdict(list) # image_id -> list of point2D_idx to update
+
+        def check_point_collision(img_id: int, p2d_idx: int) -> str:
+            if img_id not in self.images:
+                return f"Cannot add point {new_id}: Image ID {img_id} in track does not exist."
+            image = self.images[img_id]
+            if not (0 <= p2d_idx < len(image.xys)):
+                return f"Cannot add point {new_id}: Point2D index {p2d_idx} is out of bounds for image {img_id} (size: {len(self.images[img_id].xys)})."
+            if image.point3D_ids[p2d_idx] != INVALID_POINT3D_ID:
+                if image.point3D_ids[p2d_idx] != new_id:
+                    return f"Cannot add point {new_id}: 2D feature at index {p2d_idx} in image {img_id} is already assigned to Point3D ID {image.point3D_ids[p2d_idx]}."
+            return ""
+
+        for img_id, p2d_idx in track:
+            error_msg: str = check_point_collision(img_id, p2d_idx)
+            if error_msg != "": raise ValueError(error_msg)
+            images_to_update[img_id].append(p2d_idx)
+
+        try:
+            new_point = Point3D(
+                id=new_id, 
+                xyz=xyz, 
+                rgb=rgb, 
+                error=error,
+                image_ids=image_ids, 
+                point2D_idxs=point2D_idxs
+            )
+        except ValueError as e:
+            self._last_point3D_id -= 1
+            raise e
+
+        self.points3D[new_id] = new_point
+
+        # Update the corresponding images' point3D_ids list
+        try:
+            for img_id, indices in images_to_update.items():
+                 for p2d_idx in indices:
+                    if 0 <= p2d_idx < len(self.images[img_id].point3D_ids):
+                        self.images[img_id].point3D_ids[p2d_idx] = new_id
+
+        except Exception as e:
+            del self.points3D[new_id]
+            self._last_point3D_id -= 1
+            # TODO: Reverting image changes is complex, might need temporary storage or Image methods
+            raise RuntimeError(f"Failed to update image tracks for Point3D {new_id}.") from e
+
+        return new_id
+
+    def delete_camera(self, camera_id: int, force: bool = False) -> None:
+        """
+        Deletes a camera from the reconstruction.
+
+        Args:
+            camera_id: The ID of the camera to delete.
+            force: If True, also deletes all images using this camera. If False
+                   (default), raises an error if the camera is still in use.
+
+        Returns:
+            True if the camera was deleted, False if it was not found.
+
+        Raises:
+            ValueError: If `force` is False and the camera is still used by images.
+        """
+        if camera_id not in self.cameras: return
         images_using_camera = [img_id for img_id, img in self.images.items() if img.camera_id == camera_id]
-        
-        if images_using_camera:
-            if delete_images:
-                # Delete all images using this camera
-                for image_id in images_using_camera:
-                    self.delete_image(image_id)
-            else:
-                raise ValueError(f"Cannot delete camera {camera_id} because it is used by {len(images_using_camera)} images")
-        
-        # Delete camera
+
+        if len(images_using_camera) > 0:
+            if not force:
+                raise ValueError(
+                    f"Camera {camera_id} is used by {len(images_using_camera)} images "
+                    f"(e.g., ID {images_using_camera[0]}). Use force=True to delete images too."
+                )
+
+            for img_id in list(images_using_camera):
+                self.delete_image(img_id)
+
         del self.cameras[camera_id]
-    
+
+    def delete_image(self, image_id: int) -> None:
+        """
+        Deletes an image from the reconstruction.
+
+        Also removes this image's observations from the tracks of all 3D points
+        it observes. If removing an observation causes a 3D point's track to
+        become empty, that 3D point is also deleted.
+
+        Args:
+            image_id: The ID of the image to delete.
+
+        Returns:
+            True if the image was deleted, False if it was not found.
+        """
+        if image_id not in self.images: return 
+        image_to_delete = self.images[image_id]
+        points_to_check_for_deletion: Set[int] = set()
+
+        # Removes point observations from image
+        for p2d_idx, point3D_id in enumerate(image_to_delete.point3D_ids):
+            if point3D_id != INVALID_POINT3D_ID and point3D_id in self.points3D:
+                point = self.points3D[point3D_id]
+                removed = point.remove_observation(image_id, p2d_idx)
+                if removed and point.get_track_length() == 0:
+                    points_to_check_for_deletion.add(point3D_id)
+
+        # Delete from scene points whose tracks became empty
+        for point3D_id in points_to_check_for_deletion:
+            if point3D_id in self.points3D and self.points3D[point3D_id].get_track_length() == 0:
+                del self.points3D[point3D_id]
+
+        # Removes image from internal lookup
+        if image_to_delete.name in self._image_name_to_id:
+            del self._image_name_to_id[image_to_delete.name]
+
+        del self.images[image_id]
+
+
     def delete_point3D(self, point3D_id: int) -> None:
-        """Delete a 3D point from the reconstruction.
-        
-        Args:
-            point3D_id: ID of the 3D point to delete
         """
-        if point3D_id not in self.points3D:
-            raise ValueError(f"Point3D ID {point3D_id} not found")
-        
-        # Get 3D point
-        point3D = self.points3D[point3D_id]
-        
-        # Update images
-        for image_id, point2D_idx in zip(point3D.image_ids, point3D.point2D_idxs):
-            if image_id in self.images:
-                image = self.images[image_id]
-                
-                # Find 2D point corresponding to this 3D point
-                indices = [i for i, p3d_id in enumerate(image.point3D_ids) if p3d_id == point3D_id]
-                
-                for idx in indices:
-                    # Mark 2D point as not having a 3D point
-                    point3D_ids = list(image.point3D_ids)
-                    point3D_ids[idx] = INVALID_POINT3D_ID
-                    
-                    # Update image
-                    self.images[image_id] = Image(
-                        id=image.id,
-                        name=image.name,
-                        camera_id=image.camera_id,
-                        qvec=image.qvec,
-                        tvec=image.tvec,
-                        xys=image.xys,
-                        point3D_ids=point3D_ids
-                    )
-        
-        # Delete 3D point
+        Deletes a 3D point from the reconstruction.
+
+        Also updates all images that observed this point, setting the corresponding
+        `point3D_ids` entry in their feature list to `INVALID_POINT3D_ID`.
+
+        Args:
+            point3D_id: The ID of the 3D point to delete.
+
+        Returns:
+            True if the point was deleted, False if it was not found.
+        """
+        if point3D_id not in self.points3D: return
+
+        point_to_delete = self.points3D[point3D_id]
+
+        # Update observing images to invalidate their reference to this point
+        for image_id, p2d_idx in point_to_delete.get_track():
+            if image_id not in self.images:
+                print(f"Warning: Inconsistent track data for Point3D {point3D_id}. "
+                          f"Image {image_id} has no point2D at index {p2d_idx}.")
+                continue
+
+            image = self.images[image_id]
+
+            # Check bounds just in case track data is inconsistent
+            if 0 <= p2d_idx < len(image.point3D_ids):
+                    # Assuming Image features can be modified directly or via method
+                p3d_ids_list = list(image.point3D_ids) # Create mutable copy if needed
+                # Only invalidate if it currently points to the point we're deleting
+                if p3d_ids_list[p2d_idx] == point3D_id:
+                    p3d_ids_list[p2d_idx] = INVALID_POINT3D_ID
+                    # Update the image object
+                    image.update_features(image.xys, p3d_ids_list)
+
         del self.points3D[point3D_id]
-    
-    def filter_points(self, 
-                     min_track_length: int = 3, 
-                     max_error: float = float('inf'),
-                     min_angle: float = 0.0) -> int:
-        """Filter 3D points based on quality criteria.
-        
-        Args:
-            min_track_length: Minimum number of images that must observe a point
-            max_error: Maximum reprojection error
-            min_angle: Minimum triangulation angle in degrees
-            
-        Returns:
-            Number of points removed
+
+    def filter_points3D(self,
+                       min_track_len: int = 2,
+                       max_error: float = float('inf'),
+                       min_angle: float = 0.0) -> int:
         """
-        points_to_remove = []
-        
-        for point3D_id, point3D in self.points3D.items():
-            # Check track length
-            if point3D.get_track_length() < min_track_length:
-                points_to_remove.append(point3D_id)
+        Filters the 3D point cloud based on track length, reprojection error,
+        and minimum triangulation angle criteria. Points failing any criterion
+        are deleted.
+
+        Args:
+            min_track_len: Minimum number of images observing a point. Defaults to 2.
+            max_error: Maximum allowed mean reprojection error. Defaults to infinity.
+            min_angle: Minimum triangulation angle (in degrees) between any two
+                       observing camera rays. Ignored if < 2 observations or <= 0.
+                       Defaults to 0.0.
+
+        Returns:
+            The number of 3D points that were deleted.
+        """
+        points_to_delete: Set[int] = set()
+
+        for point3D_id, point in self.points3D.items():
+            # Criterion 1: Track Length
+            track_len = point.get_track_length()
+            if track_len < min_track_len:
+                points_to_delete.add(point3D_id)
                 continue
-            
-            # Check reprojection error
-            if point3D.error > max_error:
-                points_to_remove.append(point3D_id)
+
+            # Criterion 2: Reprojection Error
+            if point.error > max_error:
+                points_to_delete.add(point3D_id)
                 continue
-            
-            # Check triangulation angle
-            if min_angle > 0 and point3D.get_track_length() >= 2:
-                max_angle_found = 0.0
-                centers = []
-                
-                # Get camera centers
-                for image_id in point3D.image_ids:
-                    if image_id in self.images:
-                        centers.append(self.get_camera_center(image_id))
-                
-                # Check all pairs of cameras
-                for i in range(len(centers)):
-                    for j in range(i+1, len(centers)):
-                        # Calculate angle
-                        angle = angle_between_rays(centers[i], centers[j], point3D.xyz)
-                        max_angle_found = max(max_angle_found, angle)
-                
-                # If max angle is below threshold, remove point
-                if max_angle_found < min_angle:
-                    points_to_remove.append(point3D_id)
-        
-        # Delete filtered points
-        for point3D_id in points_to_remove:
-            self.delete_point3D(point3D_id)
-        
-        return len(points_to_remove)
-    
-    def get_points3D_for_image(self, image_id: int) -> Tuple[List[Tuple[float, float, float]], List[Tuple[int, int, int]]]:
-        """Get 3D points visible in an image.
-        
-        Args:
-            image_id: ID of the image
-            
-        Returns:
-            Tuple of (points, colors) where points is a list of 3D coordinates
-            and colors is a list of RGB values
-        """
-        if image_id not in self.images:
-            raise ValueError(f"Image ID {image_id} not found")
-        
-        image = self.images[image_id]
-        points = []
-        colors = []
-        
-        for point3D_id in image.point3D_ids:
-            if point3D_id != INVALID_POINT3D_ID and point3D_id in self.points3D:
-                point3D = self.points3D[point3D_id]
-                points.append(point3D.xyz)
-                colors.append(point3D.rgb)
-        
-        return points, colors
-    
-    def get_observations_for_point3D(self, point3D_id: int) -> List[Tuple[int, int, Tuple[float, float]]]:
-        """Get all observations of a 3D point.
-        
-        Args:
-            point3D_id: ID of the 3D point
-            
-        Returns:
-            List of tuples (image_id, point2D_idx, xy) for each observation
-        """
-        if point3D_id not in self.points3D:
-            raise ValueError(f"Point3D ID {point3D_id} not found")
-        
-        point3D = self.points3D[point3D_id]
-        observations = []
-        
-        for image_id, point2D_idx in zip(point3D.image_ids, point3D.point2D_idxs):
-            if image_id in self.images:
-                image = self.images[image_id]
-                if 0 <= point2D_idx < len(image.xys):
-                    observations.append((image_id, point2D_idx, image.xys[point2D_idx]))
-        
-        return observations
-    
-    def get_reprojection_errors(self, image_id: int) -> List[float]:
-        """Get reprojection errors for all 3D points visible in an image.
-        
-        Args:
-            image_id: ID of the image
-            
-        Returns:
-            List of reprojection errors
-        """
-        if image_id not in self.images:
-            raise ValueError(f"Image ID {image_id} not found")
-        
-        image = self.images[image_id]
-        camera = self.cameras[image.camera_id]
-        P = np.dot(camera.get_calibration_matrix(), image.get_rotation_matrix())
-        errors = []
-        
-        for xy, point3D_id in zip(image.xys, image.point3D_ids):
-            if point3D_id != INVALID_POINT3D_ID and point3D_id in self.points3D:
-                point3D = self.points3D[point3D_id]
-                
-                # Project 3D point to image
-                X = np.array([*point3D.xyz, 1.0])
-                x = np.dot(P, X)
-                x = x[:2] / x[2]
-                
-                # Calculate reprojection error
-                error = np.sqrt((x[0] - xy[0])**2 + (x[1] - xy[1])**2)
-                errors.append(error)
-        
-        return errors
-    
-    def calculate_point_cloud_stats(self) -> Dict[str, float]:
-        """Calculate statistics for the point cloud.
-        
-        Returns:
-            Dictionary with statistics (num_points, mean_track_length, mean_error)
-        """
-        if not self.points3D:
-            return {
-                "num_points": 0,
-                "mean_track_length": 0.0,
-                "mean_error": 0.0
-            }
-        
-        num_points = len(self.points3D)
-        track_lengths = [point3D.get_track_length() for point3D in self.points3D.values()]
-        errors = [point3D.error for point3D in self.points3D.values()]
-        
-        return {
-            "num_points": num_points,
-            "mean_track_length": sum(track_lengths) / num_points,
-            "mean_error": sum(errors) / num_points
-        }
-    
+
+            # Criterion 3: Triangulation Angle (only if needed and possible)
+            if min_angle > 0.0 and track_len >= 2:
+                observing_centers = []
+                for img_id, _ in point.get_track():
+                    if img_id in self.images:
+                        # Use cached camera center for efficiency
+                        observing_centers.append(self.images[img_id].get_camera_center())
+                    # else: image might have been deleted, skip this observation for angle calc
+
+                # Need at least two valid camera centers to calculate angles
+                if len(observing_centers) >= 2:
+                    max_observed_angle = 0.0
+                    # Check angle between all pairs of valid observing cameras
+                    for i in range(len(observing_centers)):
+                        for j in range(i + 1, len(observing_centers)):
+                            angle = angle_between_rays(
+                                observing_centers[i], observing_centers[j], point.xyz
+                            )
+                            max_observed_angle = max(max_observed_angle, angle)
+
+                    # If the largest angle found is still too small, filter the point
+                    if max_observed_angle < min_angle:
+                        points_to_delete.add(point3D_id)
+                        continue # Skip to next point
+
+        # Perform deletions
+        deleted_count = 0
+        for point_id in points_to_delete:
+            if self.delete_point3D(point_id):
+                deleted_count += 1
+
+        return deleted_count
+
+    def get_statistics(self) -> Dict[str, float]:
+         """
+         Calculates basic statistics about the reconstruction.
+
+         Returns:
+             A dictionary containing:
+             - 'num_cameras': Number of cameras.
+             - 'num_images': Number of registered images.
+             - 'num_points3D': Number of 3D points.
+             - 'mean_track_length': Average number of observations per 3D point.
+             - 'mean_observations_per_image': Average number of 2D features per image.
+             - 'mean_valid_observations_per_image': Average number of 2D features with
+                                                    valid 3D correspondences per image.
+             - 'mean_reprojection_error': Average reprojection error across all 3D points.
+         """
+         num_cameras = len(self.cameras)
+         num_images = len(self.images)
+         num_points = len(self.points3D)
+
+         if num_points == 0:
+             mean_track_length = 0.0
+             mean_reprojection_error = 0.0
+         else:
+             total_track_length = sum(p.get_track_length() for p in self.points3D.values())
+             mean_track_length = total_track_length / num_points
+             total_error = sum(p.error for p in self.points3D.values())
+             mean_reprojection_error = total_error / num_points
+
+         if num_images == 0:
+              mean_observations = 0.0
+              mean_valid_observations = 0.0
+         else:
+             total_obs = sum(img.num_observations() for img in self.images.values())
+             mean_observations = total_obs / num_images
+             total_valid_obs = sum(img.num_valid_observations() for img in self.images.values())
+             mean_valid_observations = total_valid_obs / num_images
+
+
+         return {
+             "num_cameras": float(num_cameras),
+             "num_images": float(num_images),
+             "num_points3D": float(num_points),
+             "mean_track_length": mean_track_length,
+             "mean_observations_per_image": mean_observations,
+             "mean_valid_observations_per_image": mean_valid_observations,
+             "mean_reprojection_error": mean_reprojection_error,
+         }
+
+
     def __str__(self) -> str:
-        """Get a string representation of the reconstruction.
-        
-        Returns:
-            String summary of the reconstruction
+        """Provides a string summary of the reconstruction."""
+        stats = self.get_statistics()
+        return (
+            f"ColmapReconstruction(path='{self.path}', "
+            f"cameras={int(stats['num_cameras'])}, images={int(stats['num_images'])}, "
+            f"points3D={int(stats['num_points3D'])}, "
+            f"mean_track_len={stats['mean_track_length']:.2f}, "
+            f"mean_reproj_err={stats['mean_reprojection_error']:.2f})"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    # --- Consistency Checks (Optional) ---
+    def _verify_consistency(self) -> None:
         """
-        return (f"COLMAP Reconstruction:\n"
-                f"  Model path: {self.model_path}\n"
-                f"  Model format: {self.model_format}\n"
-                f"  Cameras: {len(self.cameras)}\n"
-                f"  Images: {len(self.images)}\n"
-                f"  3D Points: {len(self.points3D)}")
+        Performs internal consistency checks. Useful for debugging.
+        Can be slow on large models.
+        """
+
+        print("Performing consistency checks...")
+
+        # Check image camera IDs exist
+        for img_id, img in self.images.items():
+            if img.camera_id not in self.cameras:
+                print(f"Error: Image {img_id} uses non-existent camera ID {img.camera_id}")
+
+        # Check point tracks reference valid images and indices
+        point_obs_counts = defaultdict(int)
+        for p3d_id, p3d in self.points3D.items():
+            if len(p3d.image_ids) != len(p3d.point2D_idxs):
+                 print(f"Error: Point3D {p3d_id} has mismatched track lengths ({len(p3d.image_ids)} vs {len(p3d.point2D_idxs)})")
+            for i, (img_id, p2d_idx) in enumerate(p3d.get_track()):
+                 point_obs_counts[p3d_id] += 1
+                 if img_id not in self.images:
+                     print(f"Error: Point3D {p3d_id} track references non-existent image ID {img_id}")
+                 else:
+                     image = self.images[img_id]
+                     if not (0 <= p2d_idx < len(image.xys)):
+                          print(f"Error: Point3D {p3d_id} track references out-of-bounds point2D index {p2d_idx} for image {img_id} (size {len(image.xys)})")
+                     # Check back-reference from image
+                     elif image.point3D_ids[p2d_idx] != p3d_id:
+                          print(f"Error: Point3D {p3d_id} track inconsistency. Image {img_id} point2D index {p2d_idx} points to {image.point3D_ids[p2d_idx]} instead.")
+
+        # Check image features reference valid points
+        image_obs_counts = defaultdict(int)
+        for img_id, img in self.images.items():
+            if len(img.xys) != len(img.point3D_ids):
+                print(f"Error: Image {img_id} has mismatched feature lengths ({len(img.xys)} vs {len(img.point3D_ids)})")
+            for p2d_idx, p3d_id in enumerate(img.point3D_ids):
+                if p3d_id != INVALID_POINT3D_ID:
+                     image_obs_counts[img_id] += 1
+                     if p3d_id not in self.points3D:
+                         print(f"Error: Image {img_id} point2D index {p2d_idx} references non-existent Point3D ID {p3d_id}")
+
+        print("Consistency checks finished.")

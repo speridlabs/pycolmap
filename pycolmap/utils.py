@@ -1,14 +1,9 @@
-"""
-Utility functions for working with COLMAP reconstructions.
-"""
-
 import os
 import numpy as np
 from typing import Tuple, Optional
 
 from .image import Image
 from .camera import Camera
-from .point3d import Point3D
 
 
 def detect_model_format(path: str) -> str:
@@ -193,13 +188,13 @@ def angle_between_rays(camera1_center: Tuple[float, float, float],
         Angle in degrees
     """
     # Convert to numpy arrays
-    camera1_center = np.array(camera1_center)
-    camera2_center = np.array(camera2_center)
-    point3D = np.array(point3D)
+    np_camera1_center = np.array(camera1_center)
+    np_camera2_center = np.array(camera2_center)
+    np_point3D = np.array(point3D)
     
     # Calculate rays
-    ray1 = point3D - camera1_center
-    ray2 = point3D - camera2_center
+    ray1 = np_point3D - np_camera1_center
+    ray2 = np_point3D - np_camera2_center
     
     # Normalize
     ray1 = ray1 / np.linalg.norm(ray1)
