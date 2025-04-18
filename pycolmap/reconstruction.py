@@ -495,7 +495,7 @@ class ColmapReconstruction:
     def __repr__(self) -> str:
         return self.__str__()
 
-    def _verify_consistency(self, max_workers: Optional[int] = None) -> List[str]:
+    def _verify_consistency(self, max_workers: Optional[int] = 3) -> List[str]:
         """
         Performs internal consistency checks in parallel. Useful for debugging.
 
