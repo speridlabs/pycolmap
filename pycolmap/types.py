@@ -50,5 +50,6 @@ CAMERA_MODELS = [
     CameraModel(CameraModelType.THIN_PRISM_FISHEYE.value, "THIN_PRISM_FISHEYE", 12)
 ]
 
+MAX_CAMERA_PARAMS = max(model.num_params for model in CAMERA_MODELS)
 CAMERA_MODEL_IDS = {model.model_id: model for model in CAMERA_MODELS}
 CAMERA_MODEL_NAMES = {model.model_name: model for model in CAMERA_MODELS}

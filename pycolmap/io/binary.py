@@ -1,14 +1,13 @@
 import os
 import struct
+import numpy as np
 import concurrent.futures
-from typing import Dict, Tuple, BinaryIO
+from typing import Tuple, BinaryIO, List
 
-from ..image import Image
-from ..camera import Camera
-from ..point3d import Point3D
-from ..types import CAMERA_MODEL_NAMES, CAMERA_MODEL_IDS, INVALID_POINT3D_ID
+from .data import CameraData, ImageData, Point3DData
+from ..types import CAMERA_MODEL_IDS, INVALID_POINT3D_ID, MAX_CAMERA_PARAMS
 
-def _read_next_bytes(fid: BinaryIO, num_bytes: int, format_char_sequence: str, endian_character: str = "<") -> tuple:
+def _read_next_bytes(fid: BinaryIO, num_bytes: int, format_char_sequence: str, endian: str = "<") -> tuple:
     """Read and unpack the next bytes from a binary file.
     
     Args:
@@ -21,273 +20,363 @@ def _read_next_bytes(fid: BinaryIO, num_bytes: int, format_char_sequence: str, e
         Tuple of unpacked values
     """
     data = fid.read(num_bytes)
-    return struct.unpack(endian_character + format_char_sequence, data)
+
+    if len(data) != num_bytes:
+        raise EOFError(f"Could not read {num_bytes} bytes. File truncated?")
+
+    return struct.unpack(endian + format_char_sequence, data)
 
 
-def read_cameras_binary(path: str) -> Dict[int, Camera]:
+# --- Modified Read Functions ---
+
+def read_cameras_binary(path: str) -> CameraData:
     """Read camera parameters from a COLMAP binary file.
     
     Args:
         path: Path to the cameras.bin file
         
     Returns:
-        Dictionary mapping camera_id to Camera objects
+        CameraData, packed object with several camera data
     """
-    cameras = {}
-    
+    camera_data = CameraData()
+
     with open(path, "rb") as fid:
         num_cameras = _read_next_bytes(fid, 8, "Q")[0]
-        
-        for _ in range(num_cameras):
-            camera_properties = _read_next_bytes(
-                fid, num_bytes=24, format_char_sequence="iiQQ")
-            
-            camera_id = camera_properties[0]
-            model_id = camera_properties[1]
-            width = camera_properties[2]
-            height = camera_properties[3]
-            
-            # Get model name from ID
-            model_name = CAMERA_MODEL_IDS[model_id].model_name
-            
-            # Read parameters
+        camera_data.num_cameras = num_cameras
+
+        if num_cameras == 0:
+            camera_data.ids = np.empty(0, dtype=np.uint16)
+            camera_data.model_ids = np.empty(0, dtype=np.uint8)
+            camera_data.widths = np.empty(0, dtype=np.uint32)
+            camera_data.heights = np.empty(0, dtype=np.uint32)
+            camera_data.params = np.empty((0, MAX_CAMERA_PARAMS), dtype=np.float32)
+            return camera_data
+
+        # Pre-allocate NumPy arrays
+        ids_arr = np.empty(num_cameras, dtype=np.uint16)
+        model_ids_arr = np.empty(num_cameras, dtype=np.uint8) # Assuming <= 255 models
+        widths_arr = np.empty(num_cameras, dtype=np.uint32)
+        heights_arr = np.empty(num_cameras, dtype=np.uint32)
+        params_arr = np.empty((num_cameras, MAX_CAMERA_PARAMS), dtype=np.float32)
+
+        for i in range(num_cameras):
+            cam_id, model_id, width, height = _read_next_bytes(fid, 24, "iiQQ")
+
+            ids_arr[i] = cam_id
+            model_ids_arr[i] = model_id
+            widths_arr[i] = width
+            heights_arr[i] = height
+
             num_params = CAMERA_MODEL_IDS[model_id].num_params
-            params = _read_next_bytes(fid, num_bytes=8*num_params,
-                                     format_char_sequence="d"*num_params)
-            
-            cameras[camera_id] = Camera(
-                id=camera_id,
-                model=model_name,
-                width=int(width),
-                height=int(height),
-                params=list(params)
-            )
-    
-    return cameras
+            params = _read_next_bytes(fid, 8 * num_params, "d" * num_params)
+
+            # Pad parameters to MAX_CAMERA_PARAMS and assign directly
+            params_arr[i, :num_params] = params
+            params_arr[i, num_params:] = 0 # Ensure padding is zero
+
+    # Assign pre-allocated arrays directly
+    camera_data.ids = ids_arr
+    camera_data.model_ids = model_ids_arr
+    camera_data.widths = widths_arr
+    camera_data.heights = heights_arr
+    camera_data.params = params_arr
+
+    return camera_data
 
 
-def read_images_binary(path: str, only_3d_features:bool) -> Dict[int, Image]:
+def read_images_binary(path: str, only_3d_features: bool) -> ImageData:
     """Read image data from a COLMAP binary file.
     
     Args:
         path: Path to the images.bin file
         
     Returns:
-        Dictionary mapping image_id to Image objects
+        ImageData object containing image data.
     """
-    images = {}
+    image_data = ImageData()
+    names_list = [] # Keep as list as names have variable length
+    all_xys_list = [] # Keep as list as total size unknown
+    all_point3D_ids_list = [] # Keep as list as total size unknown
+    current_feature_idx = 0
 
     with open(path, "rb") as fid:
         num_reg_images = _read_next_bytes(fid, 8, "Q")[0]
-        
-        for _ in range(num_reg_images):
-            binary_image_properties = _read_next_bytes(
-                fid, num_bytes=64, format_char_sequence="idddddddi")
-            
-            image_id = binary_image_properties[0]
-            qvec = binary_image_properties[1:5]
-            tvec = binary_image_properties[5:8]
-            camera_id = binary_image_properties[8]
-            
+        image_data.num_images = num_reg_images
+
+        if num_reg_images >= 65_535:
+            raise ValueError("Number of images exceeds 65535")
+
+        if num_reg_images == 0:
+            # Handle empty case gracefully
+            image_data.ids = np.empty(0, dtype=np.uint16)
+            image_data.qvecs = np.empty((0, 4), dtype=np.float64)
+            image_data.tvecs = np.empty((0, 3), dtype=np.float64)
+            image_data.camera_ids = np.empty(0, dtype=np.uint16)
+            image_data.names = []
+            image_data.all_xys = np.empty((0, 2), dtype=np.float64)
+            image_data.all_point3D_ids = np.empty(0, dtype=np.uint32)
+            image_data.feature_indices = np.empty((0, 2), dtype=np.uint32)
+            return image_data
+
+        # Pre-allocate arrays where size is known
+        ids_arr = np.empty(num_reg_images, dtype=np.uint16)
+        qvecs_arr = np.empty((num_reg_images, 4), dtype=np.float64)
+        tvecs_arr = np.empty((num_reg_images, 3), dtype=np.float64)
+        camera_ids_arr = np.empty(num_reg_images, dtype=np.uint16)
+        feature_indices_arr = np.empty((num_reg_images, 2), dtype=np.uint32)
+
+        for i in range(num_reg_images):
+            img_id, qw, qx, qy, qz, tx, ty, tz, cam_id = _read_next_bytes(fid, 64, "idddddddi")
+
+            ids_arr[i] = img_id
+            qvecs_arr[i] = (qw, qx, qy, qz)
+            tvecs_arr[i] = (tx, ty, tz)
+            camera_ids_arr[i] = cam_id
+
             # Read image name
-            image_name = ""
-            current_char = _read_next_bytes(fid, 1, "c")[0]
-            while current_char != b"\x00":   # look for the ASCII 0 entry
-                image_name += current_char.decode("utf-8")
-                current_char = _read_next_bytes(fid, 1, "c")[0]
-            
+            name = ""
+            char_byte = _read_next_bytes(fid, 1, "c")[0]
+            while char_byte != b"\x00":
+                name += char_byte.decode("utf-8")
+                char_byte = _read_next_bytes(fid, 1, "c")[0]
+            names_list.append(name)
+
             # Read points
-            num_points2D = _read_next_bytes(fid, num_bytes=8, format_char_sequence="Q")[0]
-            x_y_id_s = _read_next_bytes(fid, num_bytes=24*num_points2D,
-                                       format_char_sequence="ddq"*num_points2D)
-            
+            num_points2D = _read_next_bytes(fid, 8, "Q")[0]
+            start_idx = current_feature_idx
+            num_valid_points_in_image = 0
+
             # Parse points
-            xys = []
-            point3D_ids = []
+            if num_points2D > 0:
+                x_y_id_s = _read_next_bytes(fid, 24 * num_points2D, "ddq" * num_points2D)
 
-            for i in range(num_points2D):
-                x = x_y_id_s[3*i]
-                y = x_y_id_s[3*i+1]
-                point3D_id = x_y_id_s[3*i+2]
+                for j in range(num_points2D):
+                    x = x_y_id_s[3 * j]
+                    y = x_y_id_s[3 * j + 1]
+                    p3d_id = x_y_id_s[3 * j + 2]
 
-                if only_3d_features and point3D_id == INVALID_POINT3D_ID:
-                    continue
+                    if only_3d_features and p3d_id == INVALID_POINT3D_ID:
+                        continue
 
-                xys.append((x, y))
-                point3D_ids.append(point3D_id)
+                    all_xys_list.append((x, y))
+                    all_point3D_ids_list.append(p3d_id)
+                    num_valid_points_in_image += 1
 
-            images[image_id] = Image(
-                id=image_id,
-                name=image_name,
-                camera_id=camera_id,
-                qvec=qvec,
-                tvec=tvec,
-                xys=xys,
-                point3D_ids=point3D_ids
-            )
-    
-    return images
+            current_feature_idx += num_valid_points_in_image
+            feature_indices_arr[i] = (start_idx, current_feature_idx)
+
+    # Assign pre-allocated arrays
+    image_data.ids = ids_arr
+    image_data.qvecs = qvecs_arr
+    image_data.tvecs = tvecs_arr
+    image_data.camera_ids = camera_ids_arr
+    image_data.feature_indices = feature_indices_arr
+
+    # Assign names list directly
+    image_data.names = names_list
+
+    # Convert lists to arrays
+    image_data.all_xys = np.array(all_xys_list, dtype=np.float64)
+    image_data.all_point3D_ids = np.array(all_point3D_ids_list, dtype=np.uint32)
+
+    # Explicitly delete temporary lists to potentially free memory sooner
+    del all_xys_list
+    del all_point3D_ids_list
+
+    return image_data
 
 
-def read_points3D_binary(path: str) -> Dict[int, Point3D]:
+def read_points3D_binary(path: str) -> Point3DData:
     """Read 3D points from a COLMAP binary file.
     
     Args:
         path: Path to the points3D.bin file
         
     Returns:
-        Dictionary mapping point3D_id to Point3D objects
+        Point3DData object containing 3D point data.
     """
-    points3D = {}
-    
+    point_data = Point3DData()
+    all_track_img_ids_list = [] # Keep as list as total size unknown
+    all_track_p2d_idxs_list = [] # Keep as list as total size unknown
+    current_track_idx = 0
+
     with open(path, "rb") as fid:
         num_points = _read_next_bytes(fid, 8, "Q")[0]
-        
-        for _ in range(num_points):
-            binary_point_line_properties = _read_next_bytes(fid, num_bytes=43, format_char_sequence="qdddBBBd")
-            
-            point3D_id = binary_point_line_properties[0]
-            xyz = binary_point_line_properties[1:4]
-            rgb = binary_point_line_properties[4:7]
-            error = binary_point_line_properties[7]
-            
-            # Read track
-            track_length = _read_next_bytes(fid, num_bytes=8, format_char_sequence="Q")[0]
-            track_elems = _read_next_bytes(
-                fid, num_bytes=8*track_length, format_char_sequence="ii"*track_length)
-            
-            # Parse track
-            image_ids = []
-            point2D_idxs = []
-            
-            for i in range(track_length):
-                image_ids.append(track_elems[2*i])
-                point2D_idxs.append(track_elems[2*i+1])
-            
-            points3D[point3D_id] = Point3D(
-                id=point3D_id,
-                xyz=xyz,
-                rgb=rgb,
-                error=error,
-                image_ids=image_ids,
-                point2D_idxs=point2D_idxs
-            )
-    
-    return points3D
+        point_data.num_points = num_points
 
+        if num_points == 0:
+            # Handle empty case gracefully
+            point_data.ids = np.empty(0, dtype=np.uint32)
+            point_data.xyzs = np.empty((0, 3), dtype=np.float64)
+            point_data.rgbs = np.empty((0, 3), dtype=np.uint8)
+            point_data.errors = np.empty(0, dtype=np.float64)
+            point_data.all_track_image_ids = np.empty(0, dtype=np.uint16)
+            point_data.all_track_point2D_idxs = np.empty(0, dtype=np.uint32)
+            point_data.track_indices = np.empty((0, 2), dtype=np.uint32)
+            return point_data
 
-def write_cameras_binary(cameras: Dict[int, Camera], path: str) -> None:
+        # Pre-allocate arrays where size is known
+        ids_arr = np.empty(num_points, dtype=np.uint32)
+        xyzs_arr = np.empty((num_points, 3), dtype=np.float64)
+        rgbs_arr = np.empty((num_points, 3), dtype=np.uint8)
+        errors_arr = np.empty(num_points, dtype=np.float64)
+        track_indices_arr = np.empty((num_points, 2), dtype=np.uint32)
+
+        for i in range(num_points):
+            p3d_id, x, y, z, r, g, b, error = _read_next_bytes(fid, 43, "qdddBBBd")
+            ids_arr[i] = p3d_id
+            xyzs_arr[i] = (x, y, z)
+            rgbs_arr[i] = (r, g, b)
+            errors_arr[i] = error
+
+            track_len = _read_next_bytes(fid, 8, "Q")[0]
+            start_idx = current_track_idx
+
+            if track_len > 0:
+                track_elems = _read_next_bytes(fid, 8 * track_len, "ii" * track_len)
+                for j in range(track_len):
+                    all_track_img_ids_list.append(track_elems[2 * j])
+                    all_track_p2d_idxs_list.append(track_elems[2 * j + 1])
+
+            current_track_idx += track_len
+            track_indices_arr[i] = (start_idx, current_track_idx)
+
+    # Assign pre-allocated arrays
+    point_data.ids = ids_arr
+    point_data.xyzs = xyzs_arr
+    point_data.rgbs = rgbs_arr
+    point_data.errors = errors_arr
+    point_data.track_indices = track_indices_arr
+
+    # Convert lists to arrays
+    point_data.all_track_image_ids = np.array(all_track_img_ids_list, dtype=np.uint16)
+    point_data.all_track_point2D_idxs = np.array(all_track_p2d_idxs_list, dtype=np.uint32)
+
+    # Explicitly delete temporary lists to potentially free memory sooner
+    del all_track_img_ids_list
+    del all_track_p2d_idxs_list
+
+    return point_data
+
+# --- Modified Write Functions ---
+# These now require the internal numpy arrays from ColmapReconstruction
+
+def write_cameras_binary(
+    ids: np.ndarray, model_ids: np.ndarray, widths: np.ndarray,
+    heights: np.ndarray, params: np.ndarray, path: str
+) -> None:
     """Write camera parameters to a COLMAP binary file.
     
     Args:
-        cameras: Dictionary of Camera objects
         path: Output file path
     """
+    num_cameras = len(ids)
+
     with open(path, "wb") as fid:
         # Write number of cameras
-        fid.write(struct.pack("<Q", len(cameras)))
-        
-        for camera_id, camera in cameras.items():
+        fid.write(struct.pack("<Q", num_cameras))
+
+        for i in range(num_cameras):
+
             # Get model ID
-            model_id = -1
-            for camera_model in CAMERA_MODEL_NAMES.values():
-                if camera_model.model_name == camera.model:
-                    model_id = camera_model.model_id
-                    break
-            
-            if model_id == -1:
-                raise ValueError(f"Camera model {camera.model} not recognized")
-            
-            # Write camera properties
-            fid.write(struct.pack("<i", camera.id))
+            cam_id = ids[i]
+            model_id = model_ids[i]
+            width = widths[i]
+            height = heights[i]
+            cam_params = params[i] # This is the padded array
+
+            if model_id not in CAMERA_MODEL_IDS:
+                 raise ValueError(f"Invalid model ID {model_id} found for camera {cam_id}")
+            num_params = CAMERA_MODEL_IDS[model_id].num_params
+
+            fid.write(struct.pack("<i", cam_id))
             fid.write(struct.pack("<i", model_id))
-            fid.write(struct.pack("<Q", camera.width))
-            fid.write(struct.pack("<Q", camera.height))
-            
-            # Write camera parameters
-            for param in camera.params:
-                fid.write(struct.pack("<d", param))
+            fid.write(struct.pack("<Q", width))
+            fid.write(struct.pack("<Q", height))
+            # Write only the non-padded part
+            fid.write(struct.pack(f"<{num_params}d", *cam_params[:num_params]))
 
-
-def write_images_binary(images: Dict[int, Image], path: str) -> None:
+def write_images_binary(
+    ids: np.ndarray, qvecs: np.ndarray, tvecs: np.ndarray, camera_ids: np.ndarray,
+    names: List[str], all_xys: np.ndarray, all_point3D_ids: np.ndarray,
+    feature_indices: np.ndarray, path: str
+) -> None:
     """Write image data to a COLMAP binary file.
     
     Args:
         images: Dictionary of Image objects
         path: Output file path
     """
+    num_images = len(ids)
+
     with open(path, "wb") as fid:
-        # Write number of images
-        fid.write(struct.pack("<Q", len(images)))
-        
-        for image_id, image in images.items():
-            # Write image properties
-            fid.write(struct.pack("<i", image.id))
-            for q in image.qvec:
-                fid.write(struct.pack("<d", q))
-            for t in image.tvec:
-                fid.write(struct.pack("<d", t))
-            fid.write(struct.pack("<i", image.camera_id))
-            
-            # Write image name as null-terminated string
-            for char in image.name:
-                fid.write(struct.pack("<c", char.encode("utf-8")))
-            fid.write(struct.pack("<c", b"\x00"))
-            
-            # Write number of points
-            fid.write(struct.pack("<Q", len(image.xys)))
-            
-            # Write points
-            for xy, point3D_id in zip(image.xys, image.point3D_ids):
-                fid.write(struct.pack("<dd", xy[0], xy[1]))
-                fid.write(struct.pack("<q", point3D_id))
+        fid.write(struct.pack("<Q", num_images))
+        for i in range(num_images):
+            fid.write(struct.pack("<i", ids[i]))
+            fid.write(struct.pack("<dddd", *qvecs[i]))
+            fid.write(struct.pack("<ddd", *tvecs[i]))
+            fid.write(struct.pack("<i", camera_ids[i]))
 
+            name_bytes = names[i].encode("utf-8")
+            fid.write(struct.pack(f"<{len(name_bytes)}s", name_bytes))
+            fid.write(struct.pack("<c", b"\x00")) # Null terminator
 
-def write_points3D_binary(points3D: Dict[int, Point3D], path: str) -> None:
+            start, end = feature_indices[i]
+            num_points2D = end - start
+            fid.write(struct.pack("<Q", num_points2D))
+
+            if num_points2D > 0:
+                xys = all_xys[start:end]
+                p3d_ids = all_point3D_ids[start:end]
+                for xy, p3d_id in zip(xys, p3d_ids):
+                    fid.write(struct.pack("<dd", xy[0], xy[1]))
+                    fid.write(struct.pack("<q", p3d_id))
+
+def write_points3D_binary(
+    ids: np.ndarray, xyzs: np.ndarray, rgbs: np.ndarray, errors: np.ndarray,
+    all_track_image_ids: np.ndarray, all_track_point2D_idxs: np.ndarray,
+    track_indices: np.ndarray, path: str
+) -> None:
     """Write 3D points to a COLMAP binary file.
     
     Args:
         points3D: Dictionary of Point3D objects
         path: Output file path
     """
+    num_points = len(ids)
     with open(path, "wb") as fid:
-        # Write number of points
-        fid.write(struct.pack("<Q", len(points3D)))
-        
-        for point3D_id, point3D in points3D.items():
-            # Write point properties
-            fid.write(struct.pack("<Q", point3D.id))
-            for x in point3D.xyz:
-                fid.write(struct.pack("<d", x))
-            for r in point3D.rgb:
-                fid.write(struct.pack("<B", r))
-            fid.write(struct.pack("<d", point3D.error))
-            
-            # Write track length
-            track_length = len(point3D.image_ids)
-            fid.write(struct.pack("<Q", track_length))
-            
-            # Write track elements
-            for image_id, point2D_idx in zip(point3D.image_ids, point3D.point2D_idxs):
-                fid.write(struct.pack("<ii", image_id, point2D_idx))
+        fid.write(struct.pack("<Q", num_points))
+        for i in range(num_points):
+            fid.write(struct.pack("<Q", ids[i]))
+            fid.write(struct.pack("<ddd", *xyzs[i]))
+            fid.write(struct.pack("<BBB", *rgbs[i]))
+            fid.write(struct.pack("<d", errors[i]))
+
+            start, end = track_indices[i]
+            track_len = end - start
+            fid.write(struct.pack("<Q", track_len))
+
+            if track_len > 0:
+                img_ids = all_track_image_ids[start:end]
+                p2d_idxs = all_track_point2D_idxs[start:end]
+                for img_id, p2d_idx in zip(img_ids, p2d_idxs):
+                    fid.write(struct.pack("<ii", img_id, p2d_idx))
 
 
-def read_binary_model(path: str, only_3d_features:bool) -> Tuple[Dict[int, Camera], Dict[int, Image], Dict[int, Point3D]]:
+# --- Top-Level Read/Write for Binary ---
+
+def read_binary_model(path: str, only_3d_features: bool) -> Tuple[CameraData, ImageData, Point3DData]:
     """Read a COLMAP binary model from a directory.
     
     Args:
         path: Directory containing the binary model files
         
     Returns:
-        Tuple of (cameras, images, points3D) dictionaries
+        Tuple of (cameras, images, points3D) buffer objects
     """
     cameras_path = os.path.join(path, "cameras.bin")
     images_path = os.path.join(path, "images.bin")
     points3D_path = os.path.join(path, "points3D.bin")
-
-    cameras = {}
-    images = {}
-    points3D = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         future_cameras = executor.submit(read_cameras_binary, cameras_path)
@@ -305,19 +394,25 @@ def read_binary_model(path: str, only_3d_features:bool) -> Tuple[Dict[int, Camer
     return cameras, images, points3D
 
 
-def write_binary_model(cameras: Dict[int, Camera], images: Dict[int, Image], 
-                      points3D: Dict[int, Point3D], path: str) -> None:
-    """Write a COLMAP binary model to a directory.
-    
-    Args:
-        cameras: Dictionary of Camera objects
-        images: Dictionary of Image objects
-        points3D: Dictionary of Point3D objects
-        path: Output directory
-    """
+def write_binary_model(
+    cameras: CameraData, images: ImageData, points3D: Point3DData, path: str
+) -> None:
+    """Writes the internal data structures to a binary model."""
     if not os.path.exists(path):
         os.makedirs(path)
-    
-    write_cameras_binary(cameras, os.path.join(path, "cameras.bin"))
-    write_images_binary(images, os.path.join(path, "images.bin"))
-    write_points3D_binary(points3D, os.path.join(path, "points3D.bin"))
+
+    write_cameras_binary(
+        cameras.ids, cameras.model_ids, cameras.widths, cameras.heights, cameras.params,
+        os.path.join(path, "cameras.bin")
+    )
+    write_images_binary(
+        images.ids, images.qvecs, images.tvecs, images.camera_ids, images.names,
+        images.all_xys, images.all_point3D_ids, images.feature_indices,
+        os.path.join(path, "images.bin")
+    )
+    write_points3D_binary(
+        points3D.ids, points3D.xyzs, points3D.rgbs, points3D.errors,
+        points3D.all_track_image_ids, points3D.all_track_point2D_idxs, points3D.track_indices,
+        os.path.join(path, "points3D.bin")
+    )
+

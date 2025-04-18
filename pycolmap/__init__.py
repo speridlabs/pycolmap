@@ -1,4 +1,4 @@
-__version__ = "0.1.1" # Increment version
+__version__ = "0.1.2" # Increment version
 
 __all__ = [
     # Core classes
@@ -16,24 +16,14 @@ __all__ = [
     # IO Functions
     "read_model",
     "write_model",
-    "read_cameras_binary",
-    "read_images_binary",
-    "read_points3D_binary",
-    "write_cameras_binary",
-    "write_images_binary",
-    "write_points3D_binary",
-    "read_cameras_text",
-    "read_images_text",
-    "read_points3D_text",
-    "write_cameras_text",
-    "write_images_text",
-    "write_points3D_text",
     # Utility functions
     "qvec2rotmat",
     "rotmat2qvec",
     "angle_between_rays",
     "find_model_path",
     "detect_model_format",
+    "get_projection_matrix",
+    "triangulate_point",
 ]
 
 from .camera import Camera
@@ -48,28 +38,15 @@ from .types import (
     CAMERA_MODEL_NAMES,
     INVALID_POINT3D_ID,
 )
-from .io import (
-    read_model,
-    write_model,
-    read_cameras_binary,
-    read_images_binary,
-    read_points3D_binary,
-    write_cameras_binary,
-    write_images_binary,
-    write_points3D_binary,
-    read_cameras_text,
-    read_images_text,
-    read_points3D_text,
-    write_cameras_text,
-    write_images_text,
-    write_points3D_text,
-)
+from .io import read_model, write_model
 from .utils import (
     qvec2rotmat,
     rotmat2qvec,
     angle_between_rays,
     find_model_path,
     detect_model_format,
+    get_projection_matrix,
+    triangulate_point,
 )
 
 # Suppress numpy warnings (optional, use with caution)

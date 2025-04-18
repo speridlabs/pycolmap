@@ -1,30 +1,26 @@
 import numpy as np
-from typing import List, Optional
+from typing import Optional
+from numpy.typing import NDArray
 
-from .types import CAMERA_MODEL_NAMES, CameraModelType
+from .types import CAMERA_MODEL_NAMES, CameraModelType 
 
 
 class Camera:
     """
     Represents a camera in a COLMAP reconstruction, holding intrinsic parameters.
-
-    Attributes:
-        id: Unique camera identifier.
-        model: Camera model name (must be a valid COLMAP model name).
-        width: Image width in pixels.
-        height: Image height in pixels.
-        params: List of camera intrinsic parameters.
+    NOTE: In the optimized version, instances of this class are typically created
+    on-demand for accessing data and are not stored persistently in bulk.
     """
 
     id: int
     model: str
     width: int
     height: int
-    params: List[float]
+    params: NDArray[np.float32] # Shape (N,) where N is the number of parameters
 
     _calibration_matrix: Optional[np.ndarray] = None # Cache for K matrix
 
-    def __init__(self, id: int, model: str, width: int, height: int, params: List[float]):
+    def __init__(self, id: int, model: str, width: int, height: int, params: NDArray[np.float32]):
         """
         Initializes a Camera instance.
 
@@ -33,7 +29,7 @@ class Camera:
             model: Camera model name (must be a valid COLMAP model name).
             width: Image width in pixels.
             height: Image height in pixels.
-            params: List of camera intrinsic parameters.
+            params: Numpy array of camera intrinsic parameters.
 
         Raises:
             ValueError: If the model name is unknown or the number of parameters
@@ -45,167 +41,128 @@ class Camera:
             raise ValueError("Camera width and height must be positive integers.")
 
         expected_params = CAMERA_MODEL_NAMES[model].num_params
-        if len(params) != expected_params:
-            raise ValueError(
-                f"Camera model '{model}' expects {expected_params} parameters, "
-                f"but {len(params)} were provided."
-            )
+
+        if len(params) < expected_params:
+             raise ValueError(
+                 f"Camera model '{model}' expects {expected_params} parameters, "
+                 f"but received array of length {len(params)}."
+             )
+        if len(params) > expected_params and np.any(params[expected_params:] != 0.0):
+             # Only warn if non-zero extra params exist, could be padding
+             print(f"Warning: Camera model '{model}' expects {expected_params} parameters, "
+                  f"but {len(params)} were provided. Ignoring extra values.")
+
 
         self.id = id
         self.model = model
         self.width = width
         self.height = height
-        self.params = params
+        # Store only the relevant parameters
+        self.params = np.array(params[:expected_params], dtype=np.float32)
         self._calibration_matrix = None # Invalidate cache
+
+    def get_model_id(self) -> int:
+        """Returns the numeric ID of the camera model."""
+        return CAMERA_MODEL_NAMES[self.model].model_id
+
+    def get_num_params(self) -> int:
+        """Returns the number of parameters for this camera model."""
+        return CAMERA_MODEL_NAMES[self.model].num_params
 
     def get_calibration_matrix(self) -> np.ndarray:
         """
         Calculates and returns the 3x3 camera calibration matrix (K).
-
         Handles various COLMAP camera models. Caches the result for efficiency.
-
-        Returns:
-            A 3x3 numpy array representing the calibration matrix.
-
-        Raises:
-            NotImplementedError: If the calibration matrix calculation for the
-                                 camera's model is not supported.
         """
         if self._calibration_matrix is not None:
-            return self._calibration_matrix.copy() # Return copy to prevent external modification
+            return self._calibration_matrix.copy()
 
         K = np.eye(3, dtype=np.float64)
-        p = self.params
+        p = self.params # This is already a numpy array
 
-        if self.model == CameraModelType.SIMPLE_PINHOLE.name: # f, cx, cy
-            K[0, 0] = K[1, 1] = p[0] # fx = fy = f
-            K[0, 2] = p[1]          # cx
-            K[1, 2] = p[2]          # cy
-        elif self.model == CameraModelType.PINHOLE.name: # fx, fy, cx, cy
-            K[0, 0] = p[0]          # fx
-            K[1, 1] = p[1]          # fy
-            K[0, 2] = p[2]          # cx
-            K[1, 2] = p[3]          # cy
-        elif self.model == CameraModelType.SIMPLE_RADIAL.name: # f, cx, cy, k1
-            K[0, 0] = K[1, 1] = p[0] # fx = fy = f
-            K[0, 2] = p[1]          # cx
-            K[1, 2] = p[2]          # cy
-        elif self.model == CameraModelType.RADIAL.name: # f, cx, cy, k1, k2
-            K[0, 0] = K[1, 1] = p[0] # fx = fy = f
-            K[0, 2] = p[1]          # cx
-            K[1, 2] = p[2]          # cy
-        elif self.model == CameraModelType.OPENCV.name: # fx, fy, cx, cy, k1, k2, p1, p2
-            K[0, 0] = p[0]          # fx
-            K[1, 1] = p[1]          # fy
-            K[0, 2] = p[2]          # cx
-            K[1, 2] = p[3]          # cy
-        elif self.model == CameraModelType.OPENCV_FISHEYE.name: # fx, fy, cx, cy, k1, k2, k3, k4
-             K[0, 0] = p[0]          # fx
-             K[1, 1] = p[1]          # fy
-             K[0, 2] = p[2]          # cx
-             K[1, 2] = p[3]          # cy
-        elif self.model == CameraModelType.FULL_OPENCV.name: # fx, fy, cx, cy, k1..k6, p1, p2
-             K[0, 0] = p[0]          # fx
-             K[1, 1] = p[1]          # fy
-             K[0, 2] = p[2]          # cx
-             K[1, 2] = p[3]          # cy
-        elif self.model == CameraModelType.FOV.name: # fx, fy, cx, cy, omega
-             K[0, 0] = p[0]          # fx
-             K[1, 1] = p[1]          # fy
-             K[0, 2] = p[2]          # cx
-             K[1, 2] = p[3]          # cy
-        elif self.model == CameraModelType.SIMPLE_RADIAL_FISHEYE.name: # f, cx, cy, k
-             K[0, 0] = K[1, 1] = p[0] # fx = fy = f
-             K[0, 2] = p[1]          # cx
-             K[1, 2] = p[2]          # cy
-        elif self.model == CameraModelType.RADIAL_FISHEYE.name: # f, cx, cy, k1, k2
-             K[0, 0] = K[1, 1] = p[0] # fx = fy = f
-             K[0, 2] = p[1]          # cx
-             K[1, 2] = p[2]          # cy
-        elif self.model == CameraModelType.THIN_PRISM_FISHEYE.name: # fx, fy, cx, cy, k1..k4, p1, p2, sx1, sy1
-             K[0, 0] = p[0]          # fx
-             K[1, 1] = p[1]          # fy
-             K[0, 2] = p[2]          # cx
-             K[1, 2] = p[3]          # cy
+        model_type = CAMERA_MODEL_NAMES[self.model].model_id
+
+        if model_type == CameraModelType.SIMPLE_PINHOLE.value: # f, cx, cy
+            K[0, 0] = K[1, 1] = p[0]; K[0, 2] = p[1]; K[1, 2] = p[2]
+        elif model_type == CameraModelType.PINHOLE.value: # fx, fy, cx, cy
+            K[0, 0] = p[0]; K[1, 1] = p[1]; K[0, 2] = p[2]; K[1, 2] = p[3]
+        elif model_type == CameraModelType.SIMPLE_RADIAL.value: # f, cx, cy, k1
+            K[0, 0] = K[1, 1] = p[0]; K[0, 2] = p[1]; K[1, 2] = p[2]
+        elif model_type == CameraModelType.RADIAL.value: # f, cx, cy, k1, k2
+            K[0, 0] = K[1, 1] = p[0]; K[0, 2] = p[1]; K[1, 2] = p[2]
+        elif model_type == CameraModelType.OPENCV.value: # fx, fy, cx, cy, k1, k2, p1, p2
+            K[0, 0] = p[0]; K[1, 1] = p[1]; K[0, 2] = p[2]; K[1, 2] = p[3]
+        elif model_type == CameraModelType.OPENCV_FISHEYE.value: # fx, fy, cx, cy, k1, k2, k3, k4
+            K[0, 0] = p[0]; K[1, 1] = p[1]; K[0, 2] = p[2]; K[1, 2] = p[3]
+        elif model_type == CameraModelType.FULL_OPENCV.value: # fx, fy, cx, cy, k1..k6, p1, p2
+            K[0, 0] = p[0]; K[1, 1] = p[1]; K[0, 2] = p[2]; K[1, 2] = p[3]
+        elif model_type == CameraModelType.FOV.value: # fx, fy, cx, cy, omega
+            K[0, 0] = p[0]; K[1, 1] = p[1]; K[0, 2] = p[2]; K[1, 2] = p[3]
+        elif model_type == CameraModelType.SIMPLE_RADIAL_FISHEYE.value: # f, cx, cy, k
+            K[0, 0] = K[1, 1] = p[0]; K[0, 2] = p[1]; K[1, 2] = p[2]
+        elif model_type == CameraModelType.RADIAL_FISHEYE.value: # f, cx, cy, k1, k2
+            K[0, 0] = K[1, 1] = p[0]; K[0, 2] = p[1]; K[1, 2] = p[2]
+        elif model_type == CameraModelType.THIN_PRISM_FISHEYE.value: # fx, fy, cx, cy, k1..k4, p1, p2, sx1, sy1
+            K[0, 0] = p[0]; K[1, 1] = p[1]; K[0, 2] = p[2]; K[1, 2] = p[3]
         else:
-             raise NotImplementedError(
-                 f"Calibration matrix calculation for camera model '{self.model}' is not implemented."
-             )
+             # Should not happen due to init check
+             raise NotImplementedError(f"Calibration matrix calculation for model '{self.model}' not implemented.")
 
         self._calibration_matrix = K
         return K.copy() # Return copy
 
-    def get_distortion_params(self) -> List[float]:
+    def get_distortion_params(self) -> Optional[np.ndarray]:
         """
-        Extracts and returns the distortion parameters from the camera's parameter list.
-
-        The number and meaning of distortion parameters depend on the camera model.
-
-        Returns:
-            A list containing the distortion parameters, or an empty list if the
-            model has no distortion (e.g., PINHOLE).
-
-        Raises:
-            NotImplementedError: If distortion parameter extraction for the
-                                 camera's model is not supported.
+        Extracts and returns the distortion parameters as a NumPy array.
+        Returns None if the model has no distortion parameters.
         """
         p = self.params
-        if self.model == CameraModelType.SIMPLE_PINHOLE.name or \
-           self.model == CameraModelType.PINHOLE.name:
-            return []
-        elif self.model == CameraModelType.SIMPLE_RADIAL.name: # f, cx, cy, k1
-            return p[3:] # k1
-        elif self.model == CameraModelType.RADIAL.name: # f, cx, cy, k1, k2
+        model_type = CAMERA_MODEL_NAMES[self.model].model_id
+
+        if model_type in (CameraModelType.SIMPLE_PINHOLE.value, CameraModelType.PINHOLE.value):
+            return None
+        elif model_type in (CameraModelType.SIMPLE_RADIAL.value, CameraModelType.SIMPLE_RADIAL_FISHEYE.value):
+            return p[3:] # k1 or k
+        elif model_type in (CameraModelType.RADIAL.value, CameraModelType.RADIAL_FISHEYE.value):
             return p[3:] # k1, k2
-        elif self.model == CameraModelType.OPENCV.name: # fx, fy, cx, cy, k1, k2, p1, p2
+        elif model_type == CameraModelType.OPENCV.value:
             return p[4:] # k1, k2, p1, p2
-        elif self.model == CameraModelType.OPENCV_FISHEYE.name: # fx, fy, cx, cy, k1, k2, k3, k4
+        elif model_type == CameraModelType.OPENCV_FISHEYE.value:
             return p[4:] # k1, k2, k3, k4
-        elif self.model == CameraModelType.FULL_OPENCV.name: # fx, fy, cx, cy, k1..k6, p1, p2
-            return p[4:] # k1, k2, k3, k4, k5, k6, p1, p2
-        elif self.model == CameraModelType.FOV.name: # fx, fy, cx, cy, omega
+        elif model_type == CameraModelType.FULL_OPENCV.value:
+            return p[4:] # k1..k6, p1, p2
+        elif model_type == CameraModelType.FOV.value:
             return p[4:] # omega
-        elif self.model == CameraModelType.SIMPLE_RADIAL_FISHEYE.name: # f, cx, cy, k
-            return p[3:] # k1
-        elif self.model == CameraModelType.RADIAL_FISHEYE.name: # f, cx, cy, k1, k2
-            return p[3:] # k1, k2
-        elif self.model == CameraModelType.THIN_PRISM_FISHEYE.name: # fx, fy, cx, cy, k1..k4, p1, p2, sx1, sy1
-            return p[4:] # k1, k2, k3, k4, p1, p2, sx1, sy1
+        elif model_type == CameraModelType.THIN_PRISM_FISHEYE.value:
+            return p[4:] # k1..k4, p1, p2, sx1, sy1
         else:
-            # Should not happen due to init check, but defensive programming
-            raise NotImplementedError(
-                f"Distortion parameter extraction for camera model '{self.model}' is not implemented."
-            )
+            # Should not happen
+             raise NotImplementedError(f"Distortion parameter extraction for model '{self.model}' not implemented.")
 
     def has_distortion(self) -> bool:
-        """
-        Checks if the camera model includes distortion parameters.
-
-        Returns:
-            True if the model has distortion parameters, False otherwise.
-        """
-        # Models without distortion params explicitly listed
-        no_distortion_models = {
-            CameraModelType.SIMPLE_PINHOLE.name,
-            CameraModelType.PINHOLE.name
-        }
-        return self.model not in no_distortion_models
+        """Checks if the camera model includes distortion parameters."""
+        model_type = CAMERA_MODEL_NAMES[self.model].model_id
+        return model_type not in (CameraModelType.SIMPLE_PINHOLE.value, CameraModelType.PINHOLE.value)
 
     def __repr__(self) -> str:
+        params_str = np.array2string(self.params, precision=3, separator=', ', suppress_small=True)
         return (f"Camera(id={self.id}, model='{self.model}', "
                 f"width={self.width}, height={self.height}, "
-                f"params=[{', '.join(f'{p:.3f}' for p in self.params)}])")
+                f"params={params_str})")
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Camera):
             return NotImplemented
+        # Check relevant parameters only using get_num_params
+        num_params_self = self.get_num_params()
+        num_params_other = other.get_num_params()
         return self.id == other.id and \
                self.model == other.model and \
                self.width == other.width and \
                self.height == other.height and \
-               np.allclose(self.params, other.params) # Use numpy for float comparison
+               num_params_self == num_params_other and \
+               np.allclose(self.params[:num_params_self], other.params[:num_params_other])
 
     def __hash__(self) -> int:
-         # Hash based on immutable or effectively immutable properties
-         # Convert params list to tuple for hashing
-        return hash((self.id, self.model, self.width, self.height, tuple(self.params)))
+        # Hash based on immutable or effectively immutable properties
+        return hash((self.id, self.model, self.width, self.height, self.params.tobytes()))
