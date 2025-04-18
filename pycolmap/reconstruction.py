@@ -1,3 +1,4 @@
+import concurrent.futures
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional, Set
 
@@ -34,7 +35,7 @@ class ColmapReconstruction:
     _last_image_id: int
     _last_point3D_id: int
 
-    def __init__(self, reconstruction_path: str):
+    def __init__(self, reconstruction_path: str, verify_integrity:bool = True, only_3d_features: bool = True) -> None:
         """
         Loads a COLMAP reconstruction from a specified path.
 
@@ -61,7 +62,7 @@ class ColmapReconstruction:
             )
 
         try:
-            values = read_model(model_dir)
+            values = read_model(model_dir, only_3d_features=only_3d_features)
         except (FileNotFoundError, ValueError, EOFError, RuntimeError) as e:
             raise ValueError(f"Failed to load COLMAP model from '{model_dir}': {e}")
 
@@ -73,9 +74,11 @@ class ColmapReconstruction:
         self._last_image_id = max(self.images.keys()) if self.images else 0
         self._last_point3D_id = max(self.points3D.keys()) if self.points3D else 0
 
-        # Verify consistency between images and points3D (optional but recommended)
-        # TODO: eliminate this
-        self._verify_consistency() # Can be slow for large models
+        if verify_integrity:
+            errors = self._verify_consistency()
+            if len(errors) > 0:
+                print("Warning: Inconsistencies found in the reconstruction:")
+                for error in errors: print(f"  - {error}")
 
     def save(self, output_path: Optional[str] = None, binary: bool = True) -> None:
         """
@@ -492,46 +495,77 @@ class ColmapReconstruction:
     def __repr__(self) -> str:
         return self.__str__()
 
-    # --- Consistency Checks (Optional) ---
-    def _verify_consistency(self) -> None:
+    def _verify_consistency(self, max_workers: Optional[int] = None) -> List[str]:
         """
-        Performs internal consistency checks. Useful for debugging.
-        Can be slow on large models.
+        Performs internal consistency checks in parallel. Useful for debugging.
+
+        Args:
+            max_workers: Maximum number of threads to use. If None, defaults to
+                         the number of processors on the machine, multiplied by 5,
+                         considering that tasks might be I/O bound or release the GIL.
+
+        Returns:
+            List of error messages. Empty if no errors found.
         """
+        all_errors: List[str] = []
 
-        print("Performing consistency checks...")
-
-        # Check image camera IDs exist
-        for img_id, img in self.images.items():
+        # --- Helper functions for parallel execution ---
+        def _check_single_image_camera(img_item: Tuple[int, Image]) -> List[str]:
+            img_id, img = img_item
+            errors = []
             if img.camera_id not in self.cameras:
-                print(f"Error: Image {img_id} uses non-existent camera ID {img.camera_id}")
-
-        # Check point tracks reference valid images and indices
-        point_obs_counts = defaultdict(int)
-        for p3d_id, p3d in self.points3D.items():
-            if len(p3d.image_ids) != len(p3d.point2D_idxs):
-                 print(f"Error: Point3D {p3d_id} has mismatched track lengths ({len(p3d.image_ids)} vs {len(p3d.point2D_idxs)})")
-            for i, (img_id, p2d_idx) in enumerate(p3d.get_track()):
-                 point_obs_counts[p3d_id] += 1
-                 if img_id not in self.images:
-                     print(f"Error: Point3D {p3d_id} track references non-existent image ID {img_id}")
-                 else:
-                     image = self.images[img_id]
-                     if not (0 <= p2d_idx < len(image.xys)):
-                          print(f"Error: Point3D {p3d_id} track references out-of-bounds point2D index {p2d_idx} for image {img_id} (size {len(image.xys)})")
-                     # Check back-reference from image
-                     elif image.point3D_ids[p2d_idx] != p3d_id:
-                          print(f"Error: Point3D {p3d_id} track inconsistency. Image {img_id} point2D index {p2d_idx} points to {image.point3D_ids[p2d_idx]} instead.")
-
-        # Check image features reference valid points
-        image_obs_counts = defaultdict(int)
-        for img_id, img in self.images.items():
+                errors.append(f"Image {img_id} uses non-existent camera ID {img.camera_id}")
+            # Also check feature list lengths here as it's per-image
             if len(img.xys) != len(img.point3D_ids):
-                print(f"Error: Image {img_id} has mismatched feature lengths ({len(img.xys)} vs {len(img.point3D_ids)})")
+                 errors.append(f"Image {img_id} has mismatched feature lengths ({len(img.xys)} vs {len(img.point3D_ids)})")
+            return errors
+
+        def _check_single_point_track(p3d_item: Tuple[int, Point3D]) -> List[str]:
+            p3d_id, p3d = p3d_item
+            errors = []
+            if len(p3d.image_ids) != len(p3d.point2D_idxs):
+                errors.append(f"Point3D {p3d_id} has mismatched image and point2D index lengths ({len(p3d.image_ids)} vs {len(p3d.point2D_idxs)})")
+
+            for img_id, p2d_idx in p3d.get_track():
+                if img_id not in self.images:
+                    errors.append(f"Point3D {p3d_id} track references non-existent image ID {img_id}")
+                    continue # Skip further checks for this observation if image doesn't exist
+
+                image = self.images[img_id]
+                # Check bounds first
+                if not (0 <= p2d_idx < len(image.xys)):
+                    errors.append(f"Point3D {p3d_id} track references out-of-bounds point2D index {p2d_idx} for image {img_id} (size {len(image.xys)})")
+                    continue # Skip back-reference check if index is invalid
+
+                # Check back-reference from image
+                image_p3d_id_at_idx = image.point3D_ids[p2d_idx]
+                if image_p3d_id_at_idx != p3d_id:
+                    errors.append(f"Point3D {p3d_id} track inconsistency. Image {img_id} point2D index {p2d_idx} points to {image_p3d_id_at_idx} instead.")
+            return errors
+
+        def _check_single_image_features(img_item: Tuple[int, Image]) -> List[str]:
+            img_id, img = img_item
+            errors = []
+            # Length check is done in _check_single_image_camera now
+            # Check if features point to valid points
             for p2d_idx, p3d_id in enumerate(img.point3D_ids):
                 if p3d_id != INVALID_POINT3D_ID:
-                     image_obs_counts[img_id] += 1
-                     if p3d_id not in self.points3D:
-                         print(f"Error: Image {img_id} point2D index {p2d_idx} references non-existent Point3D ID {p3d_id}")
+                    if p3d_id not in self.points3D:
+                        errors.append(f"Image {img_id} point2D index {p2d_idx} references non-existent Point3D ID {p3d_id}")
+            return errors
 
-        print("Consistency checks finished.")
+        # --- Execute checks in parallel ---
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_cam_checks = executor.map(_check_single_image_camera, self.images.items())
+            future_track_checks = executor.map(_check_single_point_track, self.points3D.items())
+            future_feat_checks = executor.map(_check_single_image_features, self.images.items())
+
+            # Collect results - flatten the lists of lists
+            for error_list in future_cam_checks:
+                all_errors.extend(error_list)
+            for error_list in future_track_checks:
+                all_errors.extend(error_list)
+            for error_list in future_feat_checks:
+                all_errors.extend(error_list)
+
+        return all_errors

@@ -1,5 +1,6 @@
 import os
 import struct
+import concurrent.futures
 from typing import Dict, Tuple, BinaryIO
 
 from ..image import Image
@@ -65,7 +66,7 @@ def read_cameras_binary(path: str) -> Dict[int, Camera]:
     return cameras
 
 
-def read_images_binary(path: str) -> Dict[int, Image]:
+def read_images_binary(path: str, only_3d_features:bool) -> Dict[int, Image]:
     """Read image data from a COLMAP binary file.
     
     Args:
@@ -75,7 +76,7 @@ def read_images_binary(path: str) -> Dict[int, Image]:
         Dictionary mapping image_id to Image objects
     """
     images = {}
-    
+
     with open(path, "rb") as fid:
         num_reg_images = _read_next_bytes(fid, 8, "Q")[0]
         
@@ -103,15 +104,18 @@ def read_images_binary(path: str) -> Dict[int, Image]:
             # Parse points
             xys = []
             point3D_ids = []
-            
+
             for i in range(num_points2D):
                 x = x_y_id_s[3*i]
                 y = x_y_id_s[3*i+1]
                 point3D_id = x_y_id_s[3*i+2]
-                
+
+                if only_3d_features and point3D_id == INVALID_POINT3D_ID:
+                    continue
+
                 xys.append((x, y))
-                point3D_ids.append(point3D_id if point3D_id != -1 else INVALID_POINT3D_ID)
-            
+                point3D_ids.append(point3D_id)
+
             images[image_id] = Image(
                 id=image_id,
                 name=image_name,
@@ -140,10 +144,7 @@ def read_points3D_binary(path: str) -> Dict[int, Point3D]:
         num_points = _read_next_bytes(fid, 8, "Q")[0]
         
         for _ in range(num_points):
-            binary_point_line_properties = _read_next_bytes(
-                # TODO: check if this works
-                fid, num_bytes=43, format_char_sequence="qdddBBBd")
-                # fid, num_bytes=43, format_char_sequence="QdddBBBd")
+            binary_point_line_properties = _read_next_bytes(fid, num_bytes=43, format_char_sequence="qdddBBBd")
             
             point3D_id = binary_point_line_properties[0]
             xyz = binary_point_line_properties[1:4]
@@ -271,7 +272,7 @@ def write_points3D_binary(points3D: Dict[int, Point3D], path: str) -> None:
                 fid.write(struct.pack("<ii", image_id, point2D_idx))
 
 
-def read_binary_model(path: str) -> Tuple[Dict[int, Camera], Dict[int, Image], Dict[int, Point3D]]:
+def read_binary_model(path: str, only_3d_features:bool) -> Tuple[Dict[int, Camera], Dict[int, Image], Dict[int, Point3D]]:
     """Read a COLMAP binary model from a directory.
     
     Args:
@@ -280,10 +281,27 @@ def read_binary_model(path: str) -> Tuple[Dict[int, Camera], Dict[int, Image], D
     Returns:
         Tuple of (cameras, images, points3D) dictionaries
     """
-    cameras = read_cameras_binary(os.path.join(path, "cameras.bin"))
-    images = read_images_binary(os.path.join(path, "images.bin"))
-    points3D = read_points3D_binary(os.path.join(path, "points3D.bin"))
-    
+    cameras_path = os.path.join(path, "cameras.bin")
+    images_path = os.path.join(path, "images.bin")
+    points3D_path = os.path.join(path, "points3D.bin")
+
+    cameras = {}
+    images = {}
+    points3D = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        future_cameras = executor.submit(read_cameras_binary, cameras_path)
+        future_images = executor.submit(read_images_binary, images_path, only_3d_features)
+        future_points3D = executor.submit(read_points3D_binary, points3D_path)
+
+        try:
+            cameras = future_cameras.result()
+            images = future_images.result()
+            points3D = future_points3D.result()
+        except Exception as e:
+            print(f"Error reading binary model files: {e}")
+            raise e
+
     return cameras, images, points3D
 
 

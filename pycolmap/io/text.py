@@ -296,7 +296,7 @@ def write_points3D_text(points3D: Dict[int, Point3D], path: str) -> None:
             fid.write(f"{point3D.id} {xyz_str} {rgb_str} {point3D.error} {track_str}\n")
 
 
-def read_text_model(path: str) -> Tuple[Dict[int, Camera], Dict[int, Image], Dict[int, Point3D]]:
+def read_text_model(path: str, only_3d_features:bool) -> Tuple[Dict[int, Camera], Dict[int, Image], Dict[int, Point3D]]:
     """Read a COLMAP text model from a directory.
     
     Args:
@@ -305,6 +305,8 @@ def read_text_model(path: str) -> Tuple[Dict[int, Camera], Dict[int, Image], Dic
     Returns:
         Tuple of (cameras, images, points3D) dictionaries
     """
+    # TODO: if only 3D features then do not store images points with id -1
+
     cameras = read_cameras_text(os.path.join(path, "cameras.txt"))
     images = read_images_text(os.path.join(path, "images.txt"))
     points3D = read_points3D_text(os.path.join(path, "points3D.txt"))

@@ -37,7 +37,7 @@ __all__ = [
 ]
 
 
-def read_model(path: str, file_format: Optional[str] = None) -> Tuple[Dict[int, Camera], Dict[int, Image], Dict[int, Point3D]]:
+def read_model(path: str, only_3d_features:bool, file_format: Optional[str] = None) -> Tuple[Dict[int, Camera], Dict[int, Image], Dict[int, Point3D]]:
     """
     Reads a COLMAP reconstruction model from a specified directory.
 
@@ -82,7 +82,7 @@ def read_model(path: str, file_format: Optional[str] = None) -> Tuple[Dict[int, 
         missing_files = [f for f in required_files if not os.path.isfile(os.path.join(path, f))]
         if missing_files:
             raise FileNotFoundError(f"Missing required binary model file(s) in '{path}': {', '.join(missing_files)}")
-        return read_binary_model(path)
+        return read_binary_model(path, only_3d_features=only_3d_features)
 
     elif resolved_format == ".txt":
          # Check for required text files before attempting read
@@ -90,7 +90,7 @@ def read_model(path: str, file_format: Optional[str] = None) -> Tuple[Dict[int, 
         missing_files = [f for f in required_files if not os.path.isfile(os.path.join(path, f))]
         if missing_files:
             raise FileNotFoundError(f"Missing required text model file(s) in '{path}': {', '.join(missing_files)}")
-        return read_text_model(path)
+        return read_text_model(path, only_3d_features=only_3d_features)
 
     else:
         raise ValueError(f"Unsupported model format specified: '{resolved_format}'. Use '.bin' or '.txt'.")
