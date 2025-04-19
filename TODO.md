@@ -1,8 +1,2 @@
-
-
-- Use less ram
-    - use numpy arrays for storing data
-    - store byte indexes only -> read from file when needed
-    - use memory mapping
-
-- Use mmap to read from  binary files
+- Add option to create a sqlite database so it can manage very large files
+- Try to see before executing it is going to fit in ram

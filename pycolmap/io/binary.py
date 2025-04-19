@@ -1,5 +1,7 @@
 import os
+import gc
 import struct
+import functools
 import numpy as np
 import concurrent.futures
 from typing import Tuple, BinaryIO, List
@@ -7,43 +9,41 @@ from typing import Tuple, BinaryIO, List
 from .data import CameraData, ImageData, Point3DData
 from ..types import CAMERA_MODEL_IDS, INVALID_POINT3D_ID, MAX_CAMERA_PARAMS
 
-def _read_next_bytes(fid: BinaryIO, num_bytes: int, format_char_sequence: str, endian: str = "<") -> tuple:
-    """Read and unpack the next bytes from a binary file.
-    
-    Args:
-        fid: Open file object
-        num_bytes: Number of bytes to read
-        format_char_sequence: Format characters for struct.unpack
-        endian_character: Endian character ('<' for little endian)
-        
-    Returns:
-        Tuple of unpacked values
-    """
-    data = fid.read(num_bytes)
+# |-----------------------------------------------------------------------|
+# |-------- This file is like this because of memory fragmentation -------|
+# |-----------------------------------------------------------------------|
 
+# Struct caching with LRU cache to reduce struct objects
+@functools.lru_cache(maxsize=128)
+def _get_struct(format_str):
+    return struct.Struct(format_str)
+
+def clear_memory_caches():
+    """Clear all memory caches to help garbage collection."""
+
+    _get_struct.cache_clear()
+    for _ in range(3):
+        gc.collect()
+
+def _read_next_bytes(fid: BinaryIO, num_bytes: int, format_char_sequence: str, endian: str = "<") -> tuple:
+    """Read and unpack the next bytes from a binary file with cached struct objects."""
+    data = fid.read(num_bytes)
+    
     if len(data) != num_bytes:
         raise EOFError(f"Could not read {num_bytes} bytes. File truncated?")
-
-    return struct.unpack(endian + format_char_sequence, data)
-
-
-# --- Modified Read Functions ---
+    
+    # Use cached struct object
+    format_string = endian + format_char_sequence
+    struct_obj = _get_struct(format_string)
+    return struct_obj.unpack(data)
 
 def read_cameras_binary(path: str) -> CameraData:
-    """Read camera parameters from a COLMAP binary file.
-    
-    Args:
-        path: Path to the cameras.bin file
-        
-    Returns:
-        CameraData, packed object with several camera data
-    """
     camera_data = CameraData()
-
+    
     with open(path, "rb") as fid:
         num_cameras = _read_next_bytes(fid, 8, "Q")[0]
         camera_data.num_cameras = num_cameras
-
+        
         if num_cameras == 0:
             camera_data.ids = np.empty(0, dtype=np.uint16)
             camera_data.model_ids = np.empty(0, dtype=np.uint8)
@@ -51,61 +51,54 @@ def read_cameras_binary(path: str) -> CameraData:
             camera_data.heights = np.empty(0, dtype=np.uint32)
             camera_data.params = np.empty((0, MAX_CAMERA_PARAMS), dtype=np.float32)
             return camera_data
-
-        # Pre-allocate NumPy arrays
+        
+        # Pre-allocate arrays
         ids_arr = np.empty(num_cameras, dtype=np.uint16)
-        model_ids_arr = np.empty(num_cameras, dtype=np.uint8) # Assuming <= 255 models
+        model_ids_arr = np.empty(num_cameras, dtype=np.uint8)
         widths_arr = np.empty(num_cameras, dtype=np.uint32)
         heights_arr = np.empty(num_cameras, dtype=np.uint32)
         params_arr = np.empty((num_cameras, MAX_CAMERA_PARAMS), dtype=np.float32)
-
+        
         for i in range(num_cameras):
             cam_id, model_id, width, height = _read_next_bytes(fid, 24, "iiQQ")
-
+            
             ids_arr[i] = cam_id
             model_ids_arr[i] = model_id
             widths_arr[i] = width
             heights_arr[i] = height
-
+            
             num_params = CAMERA_MODEL_IDS[model_id].num_params
             params = _read_next_bytes(fid, 8 * num_params, "d" * num_params)
-
-            # Pad parameters to MAX_CAMERA_PARAMS and assign directly
+            
             params_arr[i, :num_params] = params
-            params_arr[i, num_params:] = 0 # Ensure padding is zero
-
-    # Assign pre-allocated arrays directly
+            params_arr[i, num_params:] = 0
+    
+    # Assign arrays
     camera_data.ids = ids_arr
     camera_data.model_ids = model_ids_arr
     camera_data.widths = widths_arr
     camera_data.heights = heights_arr
     camera_data.params = params_arr
-
+    
     return camera_data
 
-
-def read_images_binary(path: str, only_3d_features: bool) -> ImageData:
-    """Read image data from a COLMAP binary file.
-    
-    Args:
-        path: Path to the images.bin file
-        
-    Returns:
-        ImageData object containing image data.
-    """
+def read_images_binary_optimized(path: str, only_3d_features: bool) -> ImageData:
+    """Read image data from a COLMAP binary file with memory optimization."""
     image_data = ImageData()
-    names_list = [] # Keep as list as names have variable length
-    all_xys_list = [] # Keep as list as total size unknown
-    all_point3D_ids_list = [] # Keep as list as total size unknown
-    current_feature_idx = 0
-
+    
+    # First pass: Count valid points to avoid growing lists
+    total_valid_points = 0
+    num_reg_images = 0
+    names_list = []
+    file_pos_after_names = []  # Store file positions to avoid re-reading names
+    
     with open(path, "rb") as fid:
         num_reg_images = _read_next_bytes(fid, 8, "Q")[0]
         image_data.num_images = num_reg_images
-
+        
         if num_reg_images >= 65_535:
             raise ValueError("Number of images exceeds 65535")
-
+        
         if num_reg_images == 0:
             # Handle empty case gracefully
             image_data.ids = np.empty(0, dtype=np.uint16)
@@ -117,95 +110,124 @@ def read_images_binary(path: str, only_3d_features: bool) -> ImageData:
             image_data.all_point3D_ids = np.empty(0, dtype=np.uint32)
             image_data.feature_indices = np.empty((0, 2), dtype=np.uint32)
             return image_data
-
-        # Pre-allocate arrays where size is known
-        ids_arr = np.empty(num_reg_images, dtype=np.uint16)
-        qvecs_arr = np.empty((num_reg_images, 4), dtype=np.float64)
-        tvecs_arr = np.empty((num_reg_images, 3), dtype=np.float64)
-        camera_ids_arr = np.empty(num_reg_images, dtype=np.uint16)
-        feature_indices_arr = np.empty((num_reg_images, 2), dtype=np.uint32)
-
+        
+        # Count valid points first to avoid growing lists
         for i in range(num_reg_images):
+            # Skip image header
+            header = _read_next_bytes(fid, 64, "idddddddi")
+            
+            # Read image name more efficiently
+            name_bytes = bytearray()
+            while True:
+                byte = fid.read(1)
+                if byte == b"\x00":
+                    break
+                name_bytes.extend(byte)
+            
+            name = name_bytes.decode("utf-8")
+            names_list.append(name)
+            
+            # Save file position after name
+            file_pos_after_names.append(fid.tell())
+            
+            # Read points count
+            num_points2D = _read_next_bytes(fid, 8, "Q")[0]
+            
+            if num_points2D > 0:
+                # Read all points as raw bytes instead of unpacking
+                points_data = fid.read(24 * num_points2D)
+                
+                # Count valid points - we create a view of the raw data
+                for j in range(num_points2D):
+                    # Extract just the point3D_id at offset 16 bytes within each point
+                    p3d_id = struct.unpack_from("<q", points_data, j * 24 + 16)[0]
+                    if not only_3d_features or p3d_id != INVALID_POINT3D_ID:
+                        total_valid_points += 1
+    
+    # Now pre-allocate arrays with the exact size needed
+    all_xys = np.empty((total_valid_points, 2), dtype=np.float64)
+    all_point3D_ids = np.empty(total_valid_points, dtype=np.uint32)
+    
+    # Pre-allocate other arrays
+    ids_arr = np.empty(num_reg_images, dtype=np.uint16)
+    qvecs_arr = np.empty((num_reg_images, 4), dtype=np.float64)
+    tvecs_arr = np.empty((num_reg_images, 3), dtype=np.float64)
+    camera_ids_arr = np.empty(num_reg_images, dtype=np.uint16)
+    feature_indices_arr = np.empty((num_reg_images, 2), dtype=np.uint32)
+    
+    # Second pass to fill arrays
+    current_feature_idx = 0
+    
+    with open(path, "rb") as fid:
+        # Skip num_images
+        _ = fid.read(8)
+        
+        for i in range(num_reg_images):
+            # Read image header
             img_id, qw, qx, qy, qz, tx, ty, tz, cam_id = _read_next_bytes(fid, 64, "idddddddi")
-
+            
             ids_arr[i] = img_id
             qvecs_arr[i] = (qw, qx, qy, qz)
             tvecs_arr[i] = (tx, ty, tz)
             camera_ids_arr[i] = cam_id
-
-            # Read image name
-            name = ""
-            char_byte = _read_next_bytes(fid, 1, "c")[0]
-            while char_byte != b"\x00":
-                name += char_byte.decode("utf-8")
-                char_byte = _read_next_bytes(fid, 1, "c")[0]
-            names_list.append(name)
-
+            
+            # Skip over the name (we already have it)
+            while fid.read(1) != b"\x00":
+                pass
+            
             # Read points
             num_points2D = _read_next_bytes(fid, 8, "Q")[0]
             start_idx = current_feature_idx
-            num_valid_points_in_image = 0
-
-            # Parse points
+            
             if num_points2D > 0:
-                x_y_id_s = _read_next_bytes(fid, 24 * num_points2D, "ddq" * num_points2D)
-
+                # Read all points as raw bytes
+                points_data = fid.read(24 * num_points2D)
+                
+                # Process without creating large tuples
                 for j in range(num_points2D):
-                    x = x_y_id_s[3 * j]
-                    y = x_y_id_s[3 * j + 1]
-                    p3d_id = x_y_id_s[3 * j + 2]
-
+                    offset = j * 24
+                    x = struct.unpack_from("<d", points_data, offset)[0]
+                    y = struct.unpack_from("<d", points_data, offset + 8)[0]
+                    p3d_id = struct.unpack_from("<q", points_data, offset + 16)[0]
+                    
                     if only_3d_features and p3d_id == INVALID_POINT3D_ID:
                         continue
-
-                    all_xys_list.append((x, y))
-                    all_point3D_ids_list.append(p3d_id)
-                    num_valid_points_in_image += 1
-
-            current_feature_idx += num_valid_points_in_image
+                    
+                    all_xys[current_feature_idx, 0] = x
+                    all_xys[current_feature_idx, 1] = y
+                    all_point3D_ids[current_feature_idx] = p3d_id
+                    current_feature_idx += 1
+                
+                # Explicitly delete
+                del points_data
+            
             feature_indices_arr[i] = (start_idx, current_feature_idx)
-
-    # Assign pre-allocated arrays
+    
+    # Assign arrays
     image_data.ids = ids_arr
     image_data.qvecs = qvecs_arr
     image_data.tvecs = tvecs_arr
     image_data.camera_ids = camera_ids_arr
     image_data.feature_indices = feature_indices_arr
-
-    # Assign names list directly
     image_data.names = names_list
-
-    # Convert lists to arrays
-    image_data.all_xys = np.array(all_xys_list, dtype=np.float64)
-    image_data.all_point3D_ids = np.array(all_point3D_ids_list, dtype=np.uint32)
-
-    # Explicitly delete temporary lists to potentially free memory sooner
-    del all_xys_list
-    del all_point3D_ids_list
-
+    image_data.all_xys = all_xys
+    image_data.all_point3D_ids = all_point3D_ids
+    
     return image_data
 
-
-def read_points3D_binary(path: str) -> Point3DData:
-    """Read 3D points from a COLMAP binary file.
-    
-    Args:
-        path: Path to the points3D.bin file
-        
-    Returns:
-        Point3DData object containing 3D point data.
-    """
+def read_points3D_binary_optimized(path: str) -> Point3DData:
+    """Read 3D points from a COLMAP binary file with memory optimization."""
     point_data = Point3DData()
-    all_track_img_ids_list = [] # Keep as list as total size unknown
-    all_track_p2d_idxs_list = [] # Keep as list as total size unknown
-    current_track_idx = 0
-
+    
+    # First pass: Count track elements
+    total_track_elements = 0
+    
     with open(path, "rb") as fid:
         num_points = _read_next_bytes(fid, 8, "Q")[0]
         point_data.num_points = num_points
-
+        
         if num_points == 0:
-            # Handle empty case gracefully
+            # Handle empty case
             point_data.ids = np.empty(0, dtype=np.uint32)
             point_data.xyzs = np.empty((0, 3), dtype=np.float64)
             point_data.rgbs = np.empty((0, 3), dtype=np.uint8)
@@ -214,52 +236,132 @@ def read_points3D_binary(path: str) -> Point3DData:
             point_data.all_track_point2D_idxs = np.empty(0, dtype=np.uint32)
             point_data.track_indices = np.empty((0, 2), dtype=np.uint32)
             return point_data
-
-        # Pre-allocate arrays where size is known
-        ids_arr = np.empty(num_points, dtype=np.uint32)
-        xyzs_arr = np.empty((num_points, 3), dtype=np.float64)
-        rgbs_arr = np.empty((num_points, 3), dtype=np.uint8)
-        errors_arr = np.empty(num_points, dtype=np.float64)
-        track_indices_arr = np.empty((num_points, 2), dtype=np.uint32)
-
+        
+        # Create a buffer for the track counts to avoid re-reading
+        track_lengths = np.empty(num_points, dtype=np.uint64)
+        
+        for i in range(num_points):
+            # Skip point data (43 bytes)
+            _ = fid.read(43)
+            
+            # Read track length
+            track_len = _read_next_bytes(fid, 8, "Q")[0]
+            track_lengths[i] = track_len
+            total_track_elements += track_len
+            
+            if track_len > 0:
+                # Skip track elements (8 bytes each)
+                fid.seek(8 * track_len, 1)
+    
+    # Pre-allocate arrays
+    ids_arr = np.empty(num_points, dtype=np.uint32)
+    xyzs_arr = np.empty((num_points, 3), dtype=np.float64)
+    rgbs_arr = np.empty((num_points, 3), dtype=np.uint8)
+    errors_arr = np.empty(num_points, dtype=np.float64)
+    track_indices_arr = np.empty((num_points, 2), dtype=np.uint32)
+    
+    # Allocate track arrays with exact size
+    all_track_image_ids = np.empty(total_track_elements, dtype=np.uint16)
+    all_track_point2D_idxs = np.empty(total_track_elements, dtype=np.uint32)
+    
+    # Second pass to fill arrays
+    current_track_idx = 0
+    
+    with open(path, "rb") as fid:
+        # Skip num_points
+        _ = fid.read(8)
+        
         for i in range(num_points):
             p3d_id, x, y, z, r, g, b, error = _read_next_bytes(fid, 43, "qdddBBBd")
+            
             ids_arr[i] = p3d_id
             xyzs_arr[i] = (x, y, z)
             rgbs_arr[i] = (r, g, b)
             errors_arr[i] = error
-
-            track_len = _read_next_bytes(fid, 8, "Q")[0]
+            
+            # Read track length
+            track_len = int(track_lengths[i])  # Use cached value
+            _ = fid.read(8)  # Skip the track length since we already know it
+            
             start_idx = current_track_idx
-
+            
             if track_len > 0:
-                track_elems = _read_next_bytes(fid, 8 * track_len, "ii" * track_len)
+                # Read track elements as raw bytes to avoid large tuples
+                track_data = fid.read(8 * track_len)
+                
+                # Process without creating large tuples
                 for j in range(track_len):
-                    all_track_img_ids_list.append(track_elems[2 * j])
-                    all_track_p2d_idxs_list.append(track_elems[2 * j + 1])
-
-            current_track_idx += track_len
+                    offset = j * 8
+                    img_id = struct.unpack_from("<i", track_data, offset)[0]
+                    p2d_idx = struct.unpack_from("<i", track_data, offset + 4)[0]
+                    
+                    all_track_image_ids[current_track_idx] = img_id
+                    all_track_point2D_idxs[current_track_idx] = p2d_idx
+                    current_track_idx += 1
+                
+                # Explicitly delete
+                del track_data
+            
             track_indices_arr[i] = (start_idx, current_track_idx)
-
-    # Assign pre-allocated arrays
+    
+    # Assign arrays
     point_data.ids = ids_arr
     point_data.xyzs = xyzs_arr
     point_data.rgbs = rgbs_arr
     point_data.errors = errors_arr
     point_data.track_indices = track_indices_arr
-
-    # Convert lists to arrays
-    point_data.all_track_image_ids = np.array(all_track_img_ids_list, dtype=np.uint16)
-    point_data.all_track_point2D_idxs = np.array(all_track_p2d_idxs_list, dtype=np.uint32)
-
-    # Explicitly delete temporary lists to potentially free memory sooner
-    del all_track_img_ids_list
-    del all_track_p2d_idxs_list
-
+    point_data.all_track_image_ids = all_track_image_ids
+    point_data.all_track_point2D_idxs = all_track_point2D_idxs
+    
     return point_data
 
-# --- Modified Write Functions ---
-# These now require the internal numpy arrays from ColmapReconstruction
+def relocate_to_new_memory(camera_data: CameraData, image_data: ImageData, point_data: Point3DData) -> Tuple[CameraData, ImageData, Point3DData]:
+    """
+    Create fresh memory allocations to avoid fragmentation.
+    """
+    # Create brand new objects
+    new_camera_data = CameraData()
+    new_image_data = ImageData()
+    new_point_data = Point3DData()
+    
+    # Copy camera data
+    new_camera_data.num_cameras = camera_data.num_cameras
+    new_camera_data.ids = camera_data.ids.copy()
+    new_camera_data.model_ids = camera_data.model_ids.copy()
+    new_camera_data.widths = camera_data.widths.copy()
+    new_camera_data.heights = camera_data.heights.copy()
+    new_camera_data.params = camera_data.params.copy()
+    
+    # Copy image data
+    new_image_data.num_images = image_data.num_images
+    new_image_data.ids = image_data.ids.copy()
+    new_image_data.qvecs = image_data.qvecs.copy()
+    new_image_data.tvecs = image_data.tvecs.copy()
+    new_image_data.camera_ids = image_data.camera_ids.copy()
+    new_image_data.names = list(image_data.names)  # Create a new list
+    new_image_data.all_xys = image_data.all_xys.copy()
+    new_image_data.all_point3D_ids = image_data.all_point3D_ids.copy()
+    new_image_data.feature_indices = image_data.feature_indices.copy()
+    
+    # Copy point3D data
+    new_point_data.num_points = point_data.num_points
+    new_point_data.ids = point_data.ids.copy()
+    new_point_data.xyzs = point_data.xyzs.copy()
+    new_point_data.rgbs = point_data.rgbs.copy()
+    new_point_data.errors = point_data.errors.copy()
+    new_point_data.all_track_image_ids = point_data.all_track_image_ids.copy()
+    new_point_data.all_track_point2D_idxs = point_data.all_track_point2D_idxs.copy()
+    new_point_data.track_indices = point_data.track_indices.copy()
+    
+    # Delete old objects to release memory
+    del camera_data
+    del image_data
+    del point_data
+    
+    # Force garbage collection
+    gc.collect()
+    
+    return new_camera_data, new_image_data, new_point_data
 
 def write_cameras_binary(
     ids: np.ndarray, model_ids: np.ndarray, widths: np.ndarray,
@@ -362,9 +464,6 @@ def write_points3D_binary(
                 for img_id, p2d_idx in zip(img_ids, p2d_idxs):
                     fid.write(struct.pack("<ii", img_id, p2d_idx))
 
-
-# --- Top-Level Read/Write for Binary ---
-
 def read_binary_model(path: str, only_3d_features: bool) -> Tuple[CameraData, ImageData, Point3DData]:
     """Read a COLMAP binary model from a directory.
     
@@ -377,22 +476,32 @@ def read_binary_model(path: str, only_3d_features: bool) -> Tuple[CameraData, Im
     cameras_path = os.path.join(path, "cameras.bin")
     images_path = os.path.join(path, "images.bin")
     points3D_path = os.path.join(path, "points3D.bin")
+    
+    try:
+        clear_memory_caches()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        future_cameras = executor.submit(read_cameras_binary, cameras_path)
-        future_images = executor.submit(read_images_binary, images_path, only_3d_features)
-        future_points3D = executor.submit(read_points3D_binary, points3D_path)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            # Submit tasks to read files concurrently
+            future_cameras = executor.submit(read_cameras_binary, cameras_path)
+            future_points3D = executor.submit(read_points3D_binary_optimized, points3D_path)
+            future_images = executor.submit(read_images_binary_optimized, images_path, only_3d_features)
 
-        try:
+            # Retrieve results - .result() blocks until the future is complete
+            # and raises any exceptions encountered during execution.
             cameras = future_cameras.result()
-            images = future_images.result()
             points3D = future_points3D.result()
-        except Exception as e:
-            print(f"Error reading binary model files: {e}")
-            raise e
+            images = future_images.result()
+
+        # Relocate memory after all data is loaded and retrieved from threads
+        cameras, images, points3D = relocate_to_new_memory(cameras, images, points3D)
+
+        clear_memory_caches()
+
+    except Exception as e:
+        print(f"Error reading binary model files: {e}")
+        raise e
 
     return cameras, images, points3D
-
 
 def write_binary_model(
     cameras: CameraData, images: ImageData, points3D: Point3DData, path: str
