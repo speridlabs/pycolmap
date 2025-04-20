@@ -10,7 +10,7 @@ class CameraData:
     model_ids: NDArray[np.uint8]
     widths: NDArray[np.uint32]
     heights: NDArray[np.uint32]
-    params: NDArray[np.float32]  # Shape (N, MAX_CAMERA_PARAMS)
+    params: NDArray[np.float64]  # Shape (N, MAX_CAMERA_PARAMS)
     
     def __init__(self):
         self.num_cameras = 0

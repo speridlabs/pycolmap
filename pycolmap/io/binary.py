@@ -49,7 +49,7 @@ def read_cameras_binary(path: str) -> CameraData:
             camera_data.model_ids = np.empty(0, dtype=np.uint8)
             camera_data.widths = np.empty(0, dtype=np.uint32)
             camera_data.heights = np.empty(0, dtype=np.uint32)
-            camera_data.params = np.empty((0, MAX_CAMERA_PARAMS), dtype=np.float32)
+            camera_data.params = np.empty((0, MAX_CAMERA_PARAMS), dtype=np.float64)
             return camera_data
         
         # Pre-allocate arrays
@@ -57,7 +57,7 @@ def read_cameras_binary(path: str) -> CameraData:
         model_ids_arr = np.empty(num_cameras, dtype=np.uint8)
         widths_arr = np.empty(num_cameras, dtype=np.uint32)
         heights_arr = np.empty(num_cameras, dtype=np.uint32)
-        params_arr = np.empty((num_cameras, MAX_CAMERA_PARAMS), dtype=np.float32)
+        params_arr = np.empty((num_cameras, MAX_CAMERA_PARAMS), dtype=np.float64)
         
         for i in range(num_cameras):
             cam_id, model_id, width, height = _read_next_bytes(fid, 24, "iiQQ")
