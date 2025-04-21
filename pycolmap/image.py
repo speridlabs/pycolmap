@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Tuple, List
+from typing import Tuple, List, Union
 from numpy.typing import NDArray
 
 from .utils import qvec2rotmat
@@ -26,8 +26,10 @@ class Image:
 
     # TODO: add optional here
     def __init__(self, id: int, name: str, camera_id: int,
-                 qvec: NDArray[np.float64], tvec: NDArray[np.float64],
-                 xys: NDArray[np.float64], point3D_ids: NDArray[np.uint32]):
+                 qvec: Union[NDArray[np.float64], Tuple[float, float, float, float]],
+                 tvec: Union[NDArray[np.float64], Tuple[float, float, float]],
+                 xys: Union[NDArray[np.float64], List[Tuple[float, float]]],
+                 point3D_ids: Union[NDArray[np.uint32], List[int]]):
         """
         Initializes an Image instance. Typically called internally by view objects.
 
@@ -35,25 +37,37 @@ class Image:
             id: Unique image identifier.
             name: Image file name.
             camera_id: ID of the camera used for this image.
-            qvec: NumPy array (4,) quaternion rotation [w, x, y, z].
-            tvec: NumPy array (3,) translation vector [x, y, z].
-            xys: NumPy array (N, 2) of 2D feature points.
-            point3D_ids: NumPy array (N,) of corresponding 3D point IDs.
+            qvec: NumPy array (4,) or tuple (4,) quaternion rotation [w, x, y, z].
+            tvec: NumPy array (3,) or tuple (3,) translation vector [x, y, z].
+            xys: NumPy array (N, 2) or list of (N,) tuples [(x, y), ...] of 2D feature points.
+            point3D_ids: NumPy array (N,) or list (N,) of corresponding 3D point IDs.
         """
-        if qvec.shape != (4,) or tvec.shape != (3,):
+        # Convert inputs to numpy arrays first for consistent checks and storage
+        qvec_arr = np.array(qvec, dtype=np.float64)
+        tvec_arr = np.array(tvec, dtype=np.float64)
+        xys_arr = np.array(xys, dtype=np.float64)
+        point3D_ids_arr = np.array(point3D_ids, dtype=np.uint32)
+
+        # Perform checks on the converted numpy arrays
+        if qvec_arr.shape != (4,) or tvec_arr.shape != (3,):
              raise ValueError("qvec must have shape (4,) and tvec shape (3,)")
-        if xys.ndim != 2 or xys.shape[1] != 2:
-             raise ValueError("xys must be an Nx2 array")
-        if point3D_ids.ndim != 1 or point3D_ids.shape[0] != xys.shape[0]:
-            raise ValueError(f"Number of 2D points ({xys.shape[0]}) does not match number of 3D point IDs ({point3D_ids.shape[0]})")
+        if xys_arr.ndim != 2 or xys_arr.shape[1] != 2:
+             # Check if the input was an empty list, which results in shape (0,)
+             # Allow empty features list
+             if not (xys_arr.ndim == 1 and xys_arr.shape[0] == 0):
+                 raise ValueError("xys must be an Nx2 array or an empty list")
+        if point3D_ids_arr.ndim != 1 or point3D_ids_arr.shape[0] != xys_arr.shape[0]:
+             # Allow empty features list matching empty point3D_ids
+             if not (xys_arr.shape[0] == 0 and point3D_ids_arr.shape[0] == 0):
+                 raise ValueError(f"Number of 2D points ({xys_arr.shape[0]}) does not match number of 3D point IDs ({point3D_ids_arr.shape[0]})")
 
         self.id = id
         self.name = name
         self.camera_id = camera_id
-        self.qvec = qvec.astype(np.float64)
-        self.tvec = tvec.astype(np.float64)
-        self.xys = xys.astype(np.float64)
-        self.point3D_ids = point3D_ids.astype(np.uint32) # Use standard int64
+        self.qvec = qvec_arr
+        self.tvec = tvec_arr
+        self.xys = xys_arr
+        self.point3D_ids = point3D_ids_arr
 
     def get_rotation_matrix(self) -> np.ndarray:
         """Get rotation matrix from quaternion."""

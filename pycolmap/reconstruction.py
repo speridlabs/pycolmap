@@ -1,4 +1,5 @@
 import numpy as np
+from numpy.typing import NDArray
 from typing import Dict, List, Tuple, Optional 
 
 from .image import Image
@@ -33,41 +34,41 @@ class ColmapReconstruction:
     path: str
 
     # Cameras
-    _camera_ids: np.ndarray
-    _camera_model_ids: np.ndarray
-    _camera_widths: np.ndarray
-    _camera_heights: np.ndarray
-    _camera_params: np.ndarray # Padded
+    _camera_ids: NDArray[np.uint16]
+    _camera_model_ids: NDArray[np.uint8]
+    _camera_widths: NDArray[np.uint32]
+    _camera_heights: NDArray[np.uint32]
+    _camera_params: NDArray[np.float64] # Padded (N, MAX_CAMERA_PARAMS)
     _camera_id_to_row: Dict[int, int]
     _num_cameras: int
 
     # Images
-    _image_ids: np.ndarray
-    _image_qvecs: np.ndarray
-    _image_tvecs: np.ndarray
-    _image_camera_ids: np.ndarray
+    _image_ids: NDArray[np.uint16]
+    _image_qvecs: NDArray[np.float64] # (N, 4)
+    _image_tvecs: NDArray[np.float64] # (N, 3)
+    _image_camera_ids: NDArray[np.uint16]
     _image_names: List[str]
     _image_id_to_row: Dict[int, int]
     _image_name_to_id: Dict[str, int]
     _num_images: int
 
     # Image Features (Concatenated)
-    _all_xys: np.ndarray
-    _all_point3D_ids: np.ndarray
-    _image_feature_indices: np.ndarray # (N_images, 2) [start, end)
+    _all_xys: NDArray[np.float64] # (TotalPoints, 2)
+    _all_point3D_ids: NDArray[np.uint32] # (TotalPoints,) - Note: COLMAP uses uint64 internally, but data class uses uint32
+    _image_feature_indices: NDArray[np.uint32] # (N_images, 2) [start, end)
 
     # 3D Points
-    _point_ids: np.ndarray
-    _point_xyzs: np.ndarray
-    _point_rgbs: np.ndarray
-    _point_errors: np.ndarray
+    _point_ids: NDArray[np.uint32] # Note: COLMAP uses uint64 internally, but data class uses uint32
+    _point_xyzs: NDArray[np.float64] # (M, 3)
+    _point_rgbs: NDArray[np.uint8] # (M, 3)
+    _point_errors: NDArray[np.float64] # (M,)
     _point3D_id_to_row: Dict[int, int]
     _num_points3D: int
 
     # Point Tracks (Concatenated)
-    _all_track_image_ids: np.ndarray
-    _all_track_point2D_idxs: np.ndarray
-    _point_track_indices: np.ndarray # (N_points, 2) [start, end)
+    _all_track_image_ids: NDArray[np.uint16] # (TotalTrackLen,)
+    _all_track_point2D_idxs: NDArray[np.uint32] # (TotalTrackLen,)
+    _point_track_indices: NDArray[np.uint32] # (M, 2) [start, end)
 
     # --- API Facade ---
     cameras: CameraView
@@ -149,9 +150,9 @@ class ColmapReconstruction:
 
         # --- Initialize ID counters ---
         # Use max() safely on potentially empty arrays
-        self._last_camera_id = np.max(self._camera_ids) if self._num_cameras > 0 else 0
-        self._last_image_id = np.max(self._image_ids) if self._num_images > 0 else 0
-        self._last_point3D_id = np.max(self._point_ids) if self._num_points3D > 0 else 0
+        self._last_camera_id = int(np.max(self._camera_ids) if self._num_cameras > 0 else 0)
+        self._last_image_id = int(np.max(self._image_ids) if self._num_images > 0 else 0)
+        self._last_point3D_id = int(np.max(self._point_ids) if self._num_points3D > 0 else 0)
 
         if verify_integrity:
             errors = self._verify_consistency()
@@ -388,7 +389,7 @@ class ColmapReconstruction:
         if not points_data: return []
 
         num_new_points = len(points_data)
-        new_ids = np.arange(self._last_point3D_id + 1, self._last_point3D_id + 1 + num_new_points, dtype=np.int64)
+        new_ids = np.arange(self._last_point3D_id + 1, self._last_point3D_id + 1 + num_new_points, dtype=np.uint32)
         self._last_point3D_id += num_new_points # Reserve IDs immediately
 
         # lists to collect validated data

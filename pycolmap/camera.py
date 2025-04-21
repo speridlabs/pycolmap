@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Optional
+from typing import Optional, Union, List
 from numpy.typing import NDArray
 
 from .types import CAMERA_MODEL_NAMES, CameraModelType 
@@ -20,7 +20,7 @@ class Camera:
 
     _calibration_matrix: Optional[np.ndarray] = None # Cache for K matrix
 
-    def __init__(self, id: int, model: str, width: int, height: int, params: NDArray[np.float32]):
+    def __init__(self, id: int, model: str, width: int, height: int, params: Union[NDArray[np.float32], List[float]]):
         """
         Initializes a Camera instance.
 
@@ -29,7 +29,7 @@ class Camera:
             model: Camera model name (must be a valid COLMAP model name).
             width: Image width in pixels.
             height: Image height in pixels.
-            params: Numpy array of camera intrinsic parameters.
+            params: Numpy array or list of camera intrinsic parameters.
 
         Raises:
             ValueError: If the model name is unknown or the number of parameters
@@ -57,8 +57,9 @@ class Camera:
         self.model = model
         self.width = width
         self.height = height
-        # Store only the relevant parameters
-        self.params = np.array(params[:expected_params], dtype=np.float32)
+        # Ensure params is a numpy array of the correct type and store only the relevant ones
+        params_array = np.array(params, dtype=np.float32)
+        self.params = params_array[:expected_params]
         self._calibration_matrix = None # Invalidate cache
 
     def get_model_id(self) -> int:
