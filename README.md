@@ -1,19 +1,6 @@
 # pycolmap
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
 A Python library for working with COLMAP reconstructions, providing a clean and intuitive API for loading, manipulating, and saving COLMAP projects in both binary and text formats.
-
-## Features
-
-- **Format Support**: Load and save COLMAP reconstructions in both binary and text formats
-- **Automatic Detection**: Intelligently finds model files in standard locations (`sparse/0`, `sparse`, or root directory)
-- **Complete Data Access**: Easy access to cameras, images, and 3D points with type-safe classes
-- **Manipulation API**: Add/delete cameras, images, and 3D points with proper reference updating
-- **Filtering**: Remove low-quality 3D points based on track length, reprojection error, and triangulation angle
-- **Coordinate Transformations**: Convert between world and camera coordinate systems
-- **Consistency Verification**: Optional validation to ensure data integrity
-- **Comprehensive Type Annotations**: Full typing support for better IDE integration
 
 ## Installation
 
@@ -30,6 +17,18 @@ git clone https://github.com/speridlabs/pycolmap.git
 cd pycolmap
 pip install -e .
 ```
+
+## Features
+
+- **Format Support**: Load and save COLMAP reconstructions in both binary and text formats
+- **Automatic Detection**: Intelligently finds model files in standard locations (`sparse/0`, `sparse`, or root directory)
+- **Complete Data Access**: Easy access to cameras, images, and 3D points with type-safe classes
+- **Manipulation API**: Add/delete cameras, images, and 3D points with proper reference updating
+- **Filtering**: Remove low-quality 3D points based on track length, reprojection error, and triangulation angle
+- **Coordinate Transformations**: Convert between world and camera coordinate systems
+- **Consistency Verification**: Optional validation to ensure data integrity
+- **Comprehensive Type Annotations**: Full typing support for better IDE integration
+
 
 ## Quick Start
 
